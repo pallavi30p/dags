@@ -3,6 +3,7 @@ from datetime import datetime, timedelta
 from airflow import DAG
 from airflow.sensors.external_task import ExternalTaskSensor
 from airflow.operators.empty import EmptyOperator
+from airflow.utils.state import DagRunState
 
 
 with DAG(
@@ -16,14 +17,17 @@ with DAG(
     wait_for_upgrade = ExternalTaskSensor(
         task_id="wait_for_upgrade",
         external_dag_id="upgrade_dag",
-        external_task_id=None,
-        allowed_states=["success"],
-        failed_states=["failed", "skipped"],
+        external_task_id=None,  # wait for full DAG run
+
+        allowed_states=[DagRunState.SUCCESS],
+        failed_states=[DagRunState.FAILED],
+
         execution_delta=timedelta(days=0),
-        poke_interval=60,
-        timeout=60 * 60,
+
         mode="reschedule",
         deferrable=True,
+        poke_interval=60,
+        timeout=3600,
     )
 
     post_checks = EmptyOperator(task_id="post_checks")
