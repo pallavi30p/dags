@@ -1,5 +1,5 @@
 from airflow import DAG
-from airflow.providers.cloudera.operators.cde import CdeRunJobOperator
+from cloudera.airflow.providers.operators.cde import CdeRunJobOperator
 
 # Default args
 default_args = {
