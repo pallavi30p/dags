@@ -9,7 +9,7 @@ default_args = {
 with DAG(
     dag_id="cde_job_run_operator_example",
     default_args=default_args,
-    schedule_interval=None,
+    schedule=None,
     catchup=False,
     tags=["cde"],
 ) as dag:
