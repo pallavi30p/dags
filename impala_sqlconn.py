@@ -32,13 +32,13 @@ with DAG(
     write_table_impala = SQLExecuteQueryOperator(
         task_id="write_table",
         conn_id="cdw-impala-sql",
-        sql="INSERT INTO example_impala PARTITION (c)  VALUES ('test1', 1, 2)",
+        sql="INSERT INTO test_impala.example_impala PARTITION (c)  VALUES ('test1', 1, 2)",
     )
 
     read_table_impala = SQLExecuteQueryOperator(
         task_id="read_table",
         conn_id="cdw-impala-sql",
-        sql="SELECT * FROM example_impala",
+        sql="SELECT * FROM test_impala.example_impala",
     )
 
     # fmt: off
