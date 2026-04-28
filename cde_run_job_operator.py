@@ -1,13 +1,14 @@
 from airflow import DAG
+from datetime import datetime
 from cloudera.airflow.providers.operators.cde import CdeRunJobOperator
 
-# Default args
 default_args = {
     "owner": "airflow",
+    "retries": 1,
 }
 
 with DAG(
-    dag_id="cde_job_run_operator_example",
+    dag_id="cde_job_trigger_dag",
     default_args=default_args,
     schedule=None,
     catchup=False,
@@ -16,10 +17,11 @@ with DAG(
 
     run_cde_job = CdeRunJobOperator(
         task_id="run_cde_job",
-        job_name="cde_job_operator_test",   
-        connection_id="cde_operator",    
-        variables={"param1": "value1"}, 
-        timeout=3600,                  
+        connection_id="cde_operator",   # must match Airflow connection
+        job_name="vc-admin-job",  # replace with actual job name
+        wait=True,  # waits for job completion
+        timeout=3600,
+        poll_interval=10,
     )
 
     run_cde_job
