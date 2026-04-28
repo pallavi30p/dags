@@ -21,7 +21,7 @@ with DAG(
         task_id="create_table",
         conn_id="cdw-impala-sql",
         sql="""
-                CREATE TABLE IF NOT EXISTS test_impala (
+                CREATE TABLE IF NOT EXISTS test_impala.example_impala (
                     a STRING,
                     b INT
                 )
@@ -32,13 +32,13 @@ with DAG(
     write_table_impala = SQLExecuteQueryOperator(
         task_id="write_table",
         conn_id="cdw-impala-sql",
-        sql="INSERT INTO test_impala PARTITION (c)  VALUES ('test1', 1, 2)",
+        sql="INSERT INTO example_impala PARTITION (c)  VALUES ('test1', 1, 2)",
     )
 
     read_table_impala = SQLExecuteQueryOperator(
         task_id="read_table",
         conn_id="cdw-impala-sql",
-        sql="SELECT * FROM test_impala",
+        sql="SELECT * FROM example_impala",
     )
 
     # fmt: off
