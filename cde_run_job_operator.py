@@ -17,11 +17,10 @@ with DAG(
 
     run_cde_job = CdeRunJobOperator(
         task_id="run_cde_job",
-        connection_id="cde_operator",   # must match Airflow connection
-        job_name="vc-admin-job",  # replace with actual job name
-        wait=True,  # waits for job completion
+        connection_id="cde_operator",
+        job_name="vc-admin-job",
+        wait=True,
         timeout=3600,
-        poll_interval=10,
     )
 
     run_cde_job
