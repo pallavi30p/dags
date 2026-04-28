@@ -4,7 +4,7 @@ from airflow.providers.common.sql.operators.sql import SQLExecuteQueryOperator
 
 
 with DAG(
-    dag_id="cdw-impala-sql_jwt",
+    dag_id="cdw-impala-sql-jwt",
     schedule=None,
     catchup=False,
 ) as dag:
