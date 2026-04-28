@@ -9,7 +9,8 @@ with DAG(
     schedule=None,
     catchup=False,
 ) as dag:
-     create_db = SQLExecuteQueryOperator(
+
+    create_db = SQLExecuteQueryOperator(
         task_id="create_db",
         conn_id="cdw-hive-sql",
         sql="""
@@ -28,9 +29,8 @@ with DAG(
             PARTITIONED BY (c INT)
         """,
     )
-
-
     # fmt: off
     # pylint: disable=pointless-statement
     create_db >> create_table_hive_task
     # fmt: on
+ 
