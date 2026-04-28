@@ -5,16 +5,25 @@ from airflow.providers.common.sql.operators.sql import SQLExecuteQueryOperator
 
 def pretty_log_handler(cursor):
     """
-    Fetch results and print them in a nicely formatted table.
+    Safe handler:
+    - Handles queries with and without result sets
+    - Pretty prints tabular output when available
     """
+
+    # 👉 If no result set (DDL like CREATE, DROP, etc.)
+    if cursor.description is None:
+        print("Query executed successfully (no result set).")
+        return None
+
+    # 👉 Fetch rows safely
     rows = cursor.fetchall()
-    headers = [col[0] for col in cursor.description] if cursor.description else []
+    headers = [col[0] for col in cursor.description]
 
     if not rows:
         print("No rows returned.")
         return rows
 
-    # Calculate column widths
+    # Compute column widths
     col_widths = []
     for i in range(len(headers)):
         max_len = len(headers[i])
@@ -23,19 +32,16 @@ def pretty_log_handler(cursor):
             max_len = max(max_len, len(val))
         col_widths.append(max_len)
 
-    # Helper to format a row
     def format_row(row):
         return " | ".join(
             str(val if val is not None else "NULL").ljust(col_widths[i])
             for i, val in enumerate(row)
         )
 
-    # Print header
-    if headers:
-        print("\n" + format_row(headers))
-        print("-+-".join("-" * w for w in col_widths))
+    # Print table
+    print("\n" + format_row(headers))
+    print("-+-".join("-" * w for w in col_widths))
 
-    # Print rows
     for row in rows:
         print(format_row(row))
 
