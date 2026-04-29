@@ -53,7 +53,7 @@ def trigger_cai_job():
         raise Exception(f"CAI Job Trigger Failed: {response.text}")
 
 with DAG(
-    dag_id="cai_cwo_trigger_final",
+    dag_id="cai_cwo_trigger",
     default_args=default_args,
     schedule=None,
     catchup=False,
