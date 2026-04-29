@@ -56,3 +56,5 @@ with DAG(
         task_id='trigger_cai_job_task',
         python_callable=trigger_cai_job
     )
+
+    run_job
