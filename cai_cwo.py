@@ -44,7 +44,7 @@ def trigger_cai_job():
     # API Call
     response = requests.post(endpoint, headers=headers, data=json.dumps({}), verify=False)
 
-    if response.status_code == 201:
+    if response.status_code in [200, 201]:
         print(f"Success! Job triggered successfully.")
         print(f"Run ID: {response.json().get('id')}")
     else:
