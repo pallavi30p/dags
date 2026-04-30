@@ -18,7 +18,7 @@ with DAG(
     run_cde_job = CdeRunJobOperator(
         task_id="run_cde_job",
         connection_id="cde_operator",
-        job_name="vc-admin-job",
+        job_name="repo-priv-job",
         wait=True,
         timeout=3600,
     )
