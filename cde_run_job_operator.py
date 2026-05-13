@@ -24,3 +24,19 @@ with DAG(
     )
 
     run_cde_job
+
+
+# steps for creating cde connection
+# 1. Admin > Connections > Add Connection
+# 2. Cloudera Data Engineering.
+# 3. Host -> vc link
+# 4. Port -> 443
+# 5. CDP Access Key , CDP Private Key
+# 6. Schema -> default
+# 7. Extra Fields - 
+#     {
+#       "cdp_endpoint": "",
+#       "form_factor": "private",
+#       "insecure": true
+#     }
+# also get a job name to replace in L21
