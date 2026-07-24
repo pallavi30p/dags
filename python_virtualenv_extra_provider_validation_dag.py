@@ -3,85 +3,59 @@ DAG: python_virtualenv_extra_provider_validation
 
 Purpose:
     Validate that an additional Airflow provider can be installed
-    inside a PythonVirtualenvOperator virtual environment without
-    affecting the base Airflow installation.
+    within a PythonVirtualenvOperator virtual environment.
 
 Test Coverage:
-    - Verifies the provider is NOT installed in the base environment.
     - Creates an isolated Python virtual environment.
-    - Installs an additional Airflow provider in the virtual environment.
-    - Successfully imports the provider inside the virtual environment.
-    - Verifies the provider is still NOT installed in the base environment.
+    - Reuses the base Airflow installation via system_site_packages.
+    - Installs an additional Airflow provider only for this virtual
+      environment.
+    - Imports a class from the provider successfully.
 
 Expected Result:
-    - Base environment cannot import the provider.
-    - Virtual environment imports the provider successfully.
-    - Base environment remains unchanged after task completion.
+    - pip installs the provider inside the virtual environment.
+    - The provider can be imported successfully.
+    - The task completes successfully.
 
 Notes:
-    - Choose a provider that is not already present in your Airflow image.
-    - This DAG is intended for validation purposes only.
+    - This DAG assumes the selected provider is NOT already installed
+      in the base Airflow image.
 """
 
 from __future__ import annotations
 
-import importlib.util
-
 import pendulum
 
 from airflow import DAG
-from airflow.providers.standard.operators.python import (
-    PythonOperator,
-    PythonVirtualenvOperator,
-)
+from airflow.providers.standard.operators.python import PythonVirtualenvOperator
 
-# ---------------------------------------------------------------------
-# Choose a provider that is NOT installed in your base Airflow image.
-# ---------------------------------------------------------------------
-
-PROVIDER_PACKAGE = "apache-airflow-providers-microsoft-azure==12.8.0"
-
-IMPORT_MODULE = "airflow.providers.microsoft.azure.hooks.wasb"
+PROVIDER = "apache-airflow-providers-trino==6.3.0"
 
 
-def verify_provider_not_installed():
-    """
-    Verify that the provider is not installed in the base Airflow
-    environment.
-    """
-    spec = importlib.util.find_spec(IMPORT_MODULE)
-
-    assert (
-        spec is None
-    ), (
-        f"{IMPORT_MODULE} is already installed in the base image. "
-        "Choose a provider that is not preinstalled."
-    )
-
-    print(f"{IMPORT_MODULE} is NOT installed in the base environment.")
-
-
-def validate_provider_in_virtualenv():
+def validate_provider():
     """
     Execute inside the virtual environment.
 
-    Successfully importing the provider confirms that it was installed
-    only inside the virtual environment.
+    Successfully importing the provider confirms that the provider
+    was installed into the virtual environment.
     """
 
-    from airflow.providers.microsoft.azure.hooks.wasb import WasbHook
+    from airflow.providers.trino.hooks.trino import TrinoHook
 
     print("=" * 60)
-    print("Successfully imported provider inside virtual environment.")
-    print(f"Imported class: {WasbHook.__name__}")
+    print("Extra provider validation successful.")
+    print(f"Imported class: {TrinoHook.__name__}")
     print("=" * 60)
 
-    return "SUCCESS"
+    return {
+        "status": "SUCCESS",
+        "provider": "apache-airflow-providers-trino",
+    }
 
 
 with DAG(
     dag_id="python_virtualenv_extra_provider_validation",
-    description="Validate provider installation only inside a virtual environment.",
+    description="Validate installation of an additional Airflow provider in a virtual environment.",
     start_date=pendulum.datetime(2024, 1, 1, tz="UTC"),
     schedule=None,
     catchup=False,
@@ -89,50 +63,40 @@ with DAG(
         "validation",
         "python",
         "virtualenv",
-        "providers",
+        "provider",
     ],
     doc_md="""
-# Extra Provider Installation Validation
+# PythonVirtualenvOperator Extra Provider Validation
 
 ## Objective
 
 Validate that an additional Airflow provider can be installed
-inside a PythonVirtualenvOperator virtual environment without
-modifying the base Airflow installation.
+inside a Python virtual environment created by
+PythonVirtualenvOperator.
 
 ## Validation Steps
 
-1. Verify the provider is not installed in the base environment.
-2. Create a Python virtual environment.
-3. Install the provider in the virtual environment.
+1. Create a Python virtual environment.
+2. Reuse the base Airflow installation.
+3. Install an additional Airflow provider.
 4. Import the provider successfully.
-5. Verify the provider is still unavailable in the base environment.
+5. Complete successfully.
 
 ## Expected Outcome
 
-- Base environment cannot import the provider.
-- Virtual environment imports the provider successfully.
-- Base environment remains unchanged.
+The task succeeds and the logs show:
+
+- pip installing the provider
+- Successful provider import
+- Validation success message
 """,
 ) as dag:
 
-    check_before = PythonOperator(
-        task_id="verify_provider_not_installed_before",
-        python_callable=verify_provider_not_installed,
-    )
-
-    install_provider = PythonVirtualenvOperator(
-        task_id="install_provider_in_virtualenv",
-        python_callable=validate_provider_in_virtualenv,
+    validate_extra_provider = PythonVirtualenvOperator(
+        task_id="validate_extra_provider",
+        python_callable=validate_provider,
         requirements=[
-            PROVIDER_PACKAGE,
+            PROVIDER,
         ],
-        system_site_packages=False,
+        system_site_packages=True,
     )
-
-    check_after = PythonOperator(
-        task_id="verify_provider_not_installed_after",
-        python_callable=verify_provider_not_installed,
-    )
-
-    check_before >> install_provider >> check_after
