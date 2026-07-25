@@ -10,7 +10,8 @@ Hadoop/YARN client configuration files or Spark scripts in the DAG repository.
 
 At runtime this DAG:
 
-1. Downloads the latest YARN Client Configuration ZIP from Cloudera Manager.
+1. Downloads the latest YARN Client Configuration ZIP from Cloudera Manager using
+   the official REST API auto-discovery mechanism.
 2. Extracts it into a temporary directory.
 3. Dynamically generates the PySpark application script (pi.py) in a temp location.
 4. Sets HADOOP_CONF_DIR and YARN_CONF_DIR for Spark.
@@ -28,9 +29,9 @@ Connection ID
 Connection Type
     HTTP
 Host
-    https://<cm-host>:7183/cmf/services/<yarn-service-id>
+    https://<cm-host>:7183
 Example
-    https://ccycloud-1.demo1.root.comops.site:7183/cmf/services/1546335666
+    https://ccycloud-1.demo1.root.comops.site:7183
 Login
     <cloudera-manager-username>
 Password
@@ -41,9 +42,8 @@ Extra (Optional)
 }
 Notes
 
-• Host should point to the YARN service (NOT the CM home page).
-• The DAG downloads the latest client configuration using:
-      GET <host>/client-config
+• Host can point to either the CM base URL or the YARN UI page (auto-discovery
+  will extract the base host automatically).
 • If the Cloudera Manager certificate is publicly trusted,
   ca_cert_base64 is not required.
   
@@ -103,6 +103,7 @@ import shutil
 import tempfile
 import zipfile
 from datetime import datetime
+from urllib.parse import quote, urlparse
 
 import requests
 from airflow import DAG
@@ -159,23 +160,16 @@ def download_client_config() -> str:
     Download and extract the latest Hadoop/YARN client configuration.
 
     This task:
-
     1. Reads the Cloudera Manager connection (cm_yarn).
-    2. Downloads the latest YARN client configuration ZIP using an HTTP session with 
-       browser headers to avoid CM UI endpoint authorization filters.
-    3. Optionally decodes the Base64 CA certificate from the Airflow
-       connection Extra field for TLS verification.
-    4. Extracts the ZIP into a temporary directory.
-    5. Returns the extracted configuration directory via XCom.
+    2. Auto-detects the highest supported CM REST API version.
+    3. Auto-discovers the cluster name and YARN service name.
+    4. Downloads the client config ZIP via the official REST API endpoint.
+    5. Extracts the ZIP into a temporary directory and returns its path.
 
     Returns
     -------
     str
         Absolute path of the extracted Hadoop configuration directory.
-
-    Example return value
-
-        /tmp/yarn-conf-abcd1234/conf
     """
 
     conn = BaseHook.get_connection("cm_yarn")
@@ -184,40 +178,72 @@ def download_client_config() -> str:
     zip_path = os.path.join(tmp_dir, "client-config.zip")
 
     verify = True
-
     extra = conn.extra_dejson
 
-    #
-    # Optional CA certificate supplied as Base64
-    #
+    # Handle Base64 CA Certificate if provided in connection Extra
     if "ca_cert_base64" in extra:
-
         cert_path = os.path.join(tmp_dir, "cm-ca.pem")
-
         with open(cert_path, "wb") as fp:
             fp.write(base64.b64decode(extra["ca_cert_base64"]))
-
         verify = cert_path
 
-    url = f"{conn.host.rstrip('/')}/client-config"
+    # Extract base URL (e.g. https://ccycloud-1.demo1.root.comops.site:7183)
+    parsed = urlparse(conn.host)
+    base_url = f"{parsed.scheme}://{parsed.netloc}"
 
-    #
-    # Configure session with credentials & browser User-Agent header
-    # so Cloudera Manager UI routes accept programmatic requests.
-    #
     session = requests.Session()
     session.auth = (conn.login, conn.password)
-    session.headers.update({
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-    })
 
-    response = session.get(
-        url,
-        verify=verify,
-        timeout=120,
-        allow_redirects=True,
-    )
+    # 1. Determine highest supported API version
+    version_url = f"{base_url}/api/version"
+    try:
+        v_resp = session.get(version_url, verify=verify, timeout=30)
+        v_resp.raise_for_status()
+        api_version = v_resp.text.strip().strip('"')
+        if not api_version.startswith("v"):
+            api_version = f"v{api_version}"
+    except Exception as err:
+        print(f"Could not auto-detect CM API version ({err}), falling back to v41")
+        api_version = "v41"
 
+    print(f"Using Cloudera Manager REST API version: {api_version}")
+
+    # 2. Discover Clusters & YARN Service Name
+    clusters_url = f"{base_url}/api/{api_version}/clusters"
+    c_resp = session.get(clusters_url, verify=verify, timeout=30)
+    c_resp.raise_for_status()
+    clusters = c_resp.json().get("items", [])
+
+    client_config_url = None
+
+    for cluster in clusters:
+        cluster_name = cluster.get("name")
+        encoded_cluster = quote(cluster_name)
+        services_url = f"{base_url}/api/{api_version}/clusters/{encoded_cluster}/services"
+        s_resp = session.get(services_url, verify=verify, timeout=30)
+        
+        if s_resp.status_code != 200:
+            continue
+
+        services = s_resp.json().get("items", [])
+        for svc in services:
+            if svc.get("type") == "YARN":
+                svc_name = quote(svc.get("name"))
+                client_config_url = (
+                    f"{base_url}/api/{api_version}/clusters/{encoded_cluster}/services/{svc_name}/clientConfig"
+                )
+                print(f"Discovered YARN service '{svc.get('name')}' in cluster '{cluster_name}'")
+                break
+        if client_config_url:
+            break
+
+    # Fallback to direct URL if auto-discovery fails
+    if not client_config_url:
+        print("Auto-discovery could not find YARN service via REST API. Attempting fallback URL...")
+        client_config_url = conn.host if "clientConfig" in conn.host else f"{conn.host.rstrip('/')}/clientConfig"
+
+    print(f"Downloading client configuration from: {client_config_url}")
+    response = session.get(client_config_url, verify=verify, timeout=120)
     response.raise_for_status()
 
     with open(zip_path, "wb") as fp:
@@ -229,7 +255,7 @@ def download_client_config() -> str:
     with zipfile.ZipFile(zip_path) as zf:
         zf.extractall(conf_dir)
 
-    print(f"Downloaded Hadoop configuration to {conf_dir}")
+    print(f"Successfully downloaded and extracted Hadoop configuration to {conf_dir}")
 
     return conf_dir
 
@@ -272,7 +298,7 @@ with DAG(
 
     #
     # Download the latest Hadoop/YARN client configuration from
-    # Cloudera Manager.
+    # Cloudera Manager using REST API auto-discovery.
     #
     conf_dir = download_client_config()
 
