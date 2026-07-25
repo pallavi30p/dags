@@ -93,6 +93,30 @@ Client Config           (Download to /tmp)           PySpark Script
 
 ===============================================================================
 """
+"""
+===============================================================================
+DAG: spark_on_yarn_and_download_client_config
+===============================================================================
+
+Purpose
+-------
+Submit a Spark application to a CDP Base Spark-on-YARN cluster without storing
+Hadoop/YARN client configuration files, Spark binaries, or Spark scripts 
+in the DAG repository or Airflow worker image.
+
+At runtime this single-task DAG:
+
+1. Downloads the latest YARN Client Configuration ZIP from Cloudera Manager using
+   REST API auto-discovery.
+2. Extracts and scans for the exact folder containing 'yarn-site.xml'.
+3. Auto-downloads Apache Spark 3.5.4 client binaries tarball to /tmp if 'spark-submit' 
+   is not present in the local container image.
+4. Dynamically generates the PySpark application script (pi.py) locally in /tmp.
+5. Executes SparkSubmitHook in the local container with HADOOP_CONF_DIR pointing
+   directly to the active YARN configuration folder.
+6. Cleans up temporary configuration and script files upon completion.
+===============================================================================
+"""
 
 import base64
 import os
@@ -111,7 +135,7 @@ from airflow.providers.apache.spark.hooks.spark_submit import SparkSubmitHook
 
 
 def _download_client_config() -> str:
-    """Download and extract YARN client configuration to local container /tmp."""
+    """Download, extract, and locate YARN client configuration directory."""
     conn = BaseHook.get_connection("cm_yarn")
     tmp_dir = tempfile.mkdtemp(prefix="yarn-conf-")
     zip_path = os.path.join(tmp_dir, "client-config.zip")
@@ -178,32 +202,36 @@ def _download_client_config() -> str:
     with open(zip_path, "wb") as fp:
         fp.write(response.content)
 
-    conf_dir = os.path.join(tmp_dir, "conf")
-    os.makedirs(conf_dir)
+    extract_dir = os.path.join(tmp_dir, "conf")
+    os.makedirs(extract_dir)
 
     with zipfile.ZipFile(zip_path) as zf:
-        zf.extractall(conf_dir)
+        zf.extractall(extract_dir)
 
-    print(f"Extracted Hadoop configuration to {conf_dir}")
-    return conf_dir
+    # 3. Locate exact folder containing yarn-site.xml / core-site.xml
+    target_conf_dir = extract_dir
+    for root, _, files in os.walk(extract_dir):
+        if "yarn-site.xml" in files or "core-site.xml" in files:
+            target_conf_dir = root
+            print(f"Discovered active configuration files in: {target_conf_dir}")
+            break
+
+    return target_conf_dir
 
 
 def _ensure_spark_binary() -> str:
     """Check for system spark-submit; download Spark tarball to /tmp if missing."""
-    # 1. Check system PATH or standard locations
     for cmd in ["spark-submit", "spark3-submit"]:
         path_binary = shutil.which(cmd)
         if path_binary:
             print(f"Found system Spark binary at: {path_binary}")
             return path_binary
 
-    # 2. Check standard container locations
     for path in ["/opt/spark/bin/spark-submit", "/usr/bin/spark-submit"]:
         if os.path.exists(path):
             print(f"Found static Spark binary at: {path}")
             return path
 
-    # 3. Dynamic Download fallback
     tmp_spark_dir = "/tmp/spark_client"
     spark_submit_path = os.path.join(tmp_spark_dir, "spark-3.5.4-bin-hadoop3", "bin", "spark-submit")
 
@@ -227,7 +255,6 @@ def _ensure_spark_binary() -> str:
     shutil.unpack_archive(tgz_path, tmp_spark_dir)
     os.remove(tgz_path)
 
-    # Ensure binary executable permission
     st = os.stat(spark_submit_path)
     os.chmod(spark_submit_path, st.st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 
@@ -276,7 +303,7 @@ def run_spark_on_yarn():
     script_path = None
 
     try:
-        # Step 1: Download client config from Cloudera Manager
+        # Step 1: Download client config & locate yarn-site.xml directory
         conf_dir = _download_client_config()
 
         # Step 2: Ensure spark-submit is available
@@ -285,8 +312,14 @@ def run_spark_on_yarn():
         # Step 3: Generate PySpark application script
         script_path = _generate_spark_script()
 
-        # Step 4: Execute Spark submission using SparkSubmitHook
+        # Step 4: Export Hadoop & YARN environment variables explicitly
+        os.environ["HADOOP_CONF_DIR"] = conf_dir
+        os.environ["YARN_CONF_DIR"] = conf_dir
+
+        print(f"Using HADOOP_CONF_DIR: {conf_dir}")
         print(f"Submitting Spark job to YARN using binary: {spark_binary}")
+
+        # Step 5: Execute Spark submission
         spark_hook = SparkSubmitHook(
             conn_id="spark_yarn",
             deploy_mode="cluster",
@@ -304,7 +337,7 @@ def run_spark_on_yarn():
         spark_hook.submit(application=script_path)
 
     finally:
-        # Step 5: Cleanup local config & application script
+        # Step 6: Cleanup local config & application script
         if conf_dir:
             shutil.rmtree(os.path.dirname(conf_dir), ignore_errors=True)
             print("Cleaned up Hadoop configuration directory.")
