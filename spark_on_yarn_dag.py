@@ -96,6 +96,26 @@ download_client_config          generate_spark_script
 
 ===============================================================================
 """
+"""
+===============================================================================
+DAG: spark_on_yarn_and_download_client_config
+===============================================================================
+
+Purpose
+-------
+Submit a Spark application to a CDP Base Spark-on-YARN cluster without storing
+Hadoop/YARN client configuration files or Spark scripts in the DAG repository.
+
+At runtime this single-task DAG:
+
+1. Downloads the latest YARN Client Configuration ZIP from Cloudera Manager using
+   REST API auto-discovery.
+2. Extracts it into a temporary directory in the local container.
+3. Dynamically generates the PySpark application script (pi.py) locally.
+4. Executes SparkSubmitOperator in the same container with local HADOOP_CONF_DIR.
+5. Cleans up all temporary files and directories upon completion.
+===============================================================================
+"""
 
 import base64
 import os
@@ -109,21 +129,92 @@ import requests
 from airflow import DAG
 from airflow.decorators import task
 from airflow.hooks.base import BaseHook
+from airflow.operators.python import get_current_context
 from airflow.providers.apache.spark.operators.spark_submit import (
     SparkSubmitOperator,
 )
 
 
-@task
-def generate_spark_script() -> str:
-    """
-    Dynamically generate the PySpark application script (pi.py) at runtime.
+def _download_client_config() -> str:
+    """Download and extract YARN client configuration to local container /tmp."""
+    conn = BaseHook.get_connection("cm_yarn")
+    tmp_dir = tempfile.mkdtemp(prefix="yarn-conf-")
+    zip_path = os.path.join(tmp_dir, "client-config.zip")
 
-    Returns
-    -------
-    str
-        Absolute path of the generated PySpark script.
-    """
+    verify = True
+    extra = conn.extra_dejson
+
+    if "ca_cert_base64" in extra:
+        cert_path = os.path.join(tmp_dir, "cm-ca.pem")
+        with open(cert_path, "wb") as fp:
+            fp.write(base64.b64decode(extra["ca_cert_base64"]))
+        verify = cert_path
+
+    parsed = urlparse(conn.host)
+    base_url = f"{parsed.scheme}://{parsed.netloc}"
+
+    session = requests.Session()
+    session.auth = (conn.login, conn.password)
+
+    # 1. Determine API version
+    version_url = f"{base_url}/api/version"
+    try:
+        v_resp = session.get(version_url, verify=verify, timeout=30)
+        v_resp.raise_for_status()
+        api_version = v_resp.text.strip().strip('"')
+        if not api_version.startswith("v"):
+            api_version = f"v{api_version}"
+    except Exception:
+        api_version = "v57"
+
+    # 2. Discover YARN service
+    clusters_url = f"{base_url}/api/{api_version}/clusters"
+    c_resp = session.get(clusters_url, verify=verify, timeout=30)
+    c_resp.raise_for_status()
+    clusters = c_resp.json().get("items", [])
+
+    client_config_url = None
+    for cluster in clusters:
+        cluster_name = cluster.get("name")
+        encoded_cluster = quote(cluster_name)
+        services_url = f"{base_url}/api/{api_version}/clusters/{encoded_cluster}/services"
+        s_resp = session.get(services_url, verify=verify, timeout=30)
+        if s_resp.status_code != 200:
+            continue
+
+        for svc in s_resp.json().get("items", []):
+            if svc.get("type") == "YARN":
+                svc_name = quote(svc.get("name"))
+                client_config_url = (
+                    f"{base_url}/api/{api_version}/clusters/{encoded_cluster}/services/{svc_name}/clientConfig"
+                )
+                print(f"Discovered YARN service '{svc.get('name')}' in cluster '{cluster_name}'")
+                break
+        if client_config_url:
+            break
+
+    if not client_config_url:
+        client_config_url = f"{conn.host.rstrip('/')}/clientConfig"
+
+    print(f"Downloading client configuration from: {client_config_url}")
+    response = session.get(client_config_url, verify=verify, timeout=120)
+    response.raise_for_status()
+
+    with open(zip_path, "wb") as fp:
+        fp.write(response.content)
+
+    conf_dir = os.path.join(tmp_dir, "conf")
+    os.makedirs(conf_dir)
+
+    with zipfile.ZipFile(zip_path) as zf:
+        zf.extractall(conf_dir)
+
+    print(f"Extracted Hadoop configuration to {conf_dir}")
+    return conf_dir
+
+
+def _generate_spark_script() -> str:
+    """Generate PySpark script in local container /tmp."""
     tmp_dir = tempfile.mkdtemp(prefix="spark-app-")
     script_path = os.path.join(tmp_dir, "pi.py")
 
@@ -150,141 +241,54 @@ if __name__ == "__main__":
         fp.write(script_content.strip())
 
     print(f"Generated PySpark script at {script_path}")
-
     return script_path
 
 
 @task
-def download_client_config() -> str:
+def run_spark_on_yarn():
     """
-    Download and extract the latest Hadoop/YARN client configuration.
-
-    This task:
-    1. Reads the Cloudera Manager connection (cm_yarn).
-    2. Auto-detects the highest supported CM REST API version.
-    3. Auto-discovers the cluster name and YARN service name.
-    4. Downloads the client config ZIP via the official REST API endpoint.
-    5. Extracts the ZIP into a temporary directory and returns its path.
-
-    Returns
-    -------
-    str
-        Absolute path of the extracted Hadoop configuration directory.
+    Unified task that downloads configuration, generates script, and runs 
+    SparkSubmitOperator within the exact same container context.
     """
+    context = get_current_context()
+    conf_dir = None
+    script_path = None
 
-    conn = BaseHook.get_connection("cm_yarn")
-
-    tmp_dir = tempfile.mkdtemp(prefix="yarn-conf-")
-    zip_path = os.path.join(tmp_dir, "client-config.zip")
-
-    verify = True
-    extra = conn.extra_dejson
-
-    # Handle Base64 CA Certificate if provided in connection Extra
-    if "ca_cert_base64" in extra:
-        cert_path = os.path.join(tmp_dir, "cm-ca.pem")
-        with open(cert_path, "wb") as fp:
-            fp.write(base64.b64decode(extra["ca_cert_base64"]))
-        verify = cert_path
-
-    # Extract base URL (e.g. https://ccycloud-1.demo1.root.comops.site:7183)
-    parsed = urlparse(conn.host)
-    base_url = f"{parsed.scheme}://{parsed.netloc}"
-
-    session = requests.Session()
-    session.auth = (conn.login, conn.password)
-
-    # 1. Determine highest supported API version
-    version_url = f"{base_url}/api/version"
     try:
-        v_resp = session.get(version_url, verify=verify, timeout=30)
-        v_resp.raise_for_status()
-        api_version = v_resp.text.strip().strip('"')
-        if not api_version.startswith("v"):
-            api_version = f"v{api_version}"
-    except Exception as err:
-        print(f"Could not auto-detect CM API version ({err}), falling back to v41")
-        api_version = "v41"
+        # Step 1: Download client config
+        conf_dir = _download_client_config()
 
-    print(f"Using Cloudera Manager REST API version: {api_version}")
+        # Step 2: Generate Spark script
+        script_path = _generate_spark_script()
 
-    # 2. Discover Clusters & YARN Service Name
-    clusters_url = f"{base_url}/api/{api_version}/clusters"
-    c_resp = session.get(clusters_url, verify=verify, timeout=30)
-    c_resp.raise_for_status()
-    clusters = c_resp.json().get("items", [])
-
-    client_config_url = None
-
-    for cluster in clusters:
-        cluster_name = cluster.get("name")
-        encoded_cluster = quote(cluster_name)
-        services_url = f"{base_url}/api/{api_version}/clusters/{encoded_cluster}/services"
-        s_resp = session.get(services_url, verify=verify, timeout=30)
+        # Step 3: Execute SparkSubmitOperator in local container
+        print("Submitting Spark job to YARN...")
+        spark_operator = SparkSubmitOperator(
+            task_id="spark_submit_internal",
+            application=script_path,
+            conn_id="spark_yarn",
+            deploy_mode="cluster",
+            env_vars={
+                "HADOOP_CONF_DIR": conf_dir,
+                "YARN_CONF_DIR": conf_dir,
+            },
+            conf={
+                "spark.master": "yarn",
+            },
+            verbose=True,
+        )
         
-        if s_resp.status_code != 200:
-            continue
+        # Execute operator directly
+        spark_operator.execute(context)
 
-        services = s_resp.json().get("items", [])
-        for svc in services:
-            if svc.get("type") == "YARN":
-                svc_name = quote(svc.get("name"))
-                client_config_url = (
-                    f"{base_url}/api/{api_version}/clusters/{encoded_cluster}/services/{svc_name}/clientConfig"
-                )
-                print(f"Discovered YARN service '{svc.get('name')}' in cluster '{cluster_name}'")
-                break
-        if client_config_url:
-            break
-
-    # Fallback to direct URL if auto-discovery fails
-    if not client_config_url:
-        print("Auto-discovery could not find YARN service via REST API. Attempting fallback URL...")
-        client_config_url = conn.host if "clientConfig" in conn.host else f"{conn.host.rstrip('/')}/clientConfig"
-
-    print(f"Downloading client configuration from: {client_config_url}")
-    response = session.get(client_config_url, verify=verify, timeout=120)
-    response.raise_for_status()
-
-    with open(zip_path, "wb") as fp:
-        fp.write(response.content)
-
-    conf_dir = os.path.join(tmp_dir, "conf")
-    os.makedirs(conf_dir)
-
-    with zipfile.ZipFile(zip_path) as zf:
-        zf.extractall(conf_dir)
-
-    print(f"Successfully downloaded and extracted Hadoop configuration to {conf_dir}")
-
-    return conf_dir
-
-
-@task(trigger_rule="all_done")
-def cleanup(conf_dir: str, script_path: str):
-    """
-    Delete temporary Hadoop configuration and Spark script directories.
-
-    Parameters
-    ----------
-    conf_dir : str
-        Directory returned by download_client_config().
-    script_path : str
-        Path returned by generate_spark_script().
-
-    Notes
-    -----
-    This task ignores cleanup failures so that they do not mask the
-    success/failure of the Spark job itself.
-    """
-
-    if conf_dir:
-        shutil.rmtree(os.path.dirname(conf_dir), ignore_errors=True)
-        print(f"Cleaned up {os.path.dirname(conf_dir)}")
-
-    if script_path and os.path.exists(script_path):
-        shutil.rmtree(os.path.dirname(script_path), ignore_errors=True)
-        print(f"Cleaned up {os.path.dirname(script_path)}")
+    finally:
+        # Step 4: Cleanup local files
+        if conf_dir:
+            shutil.rmtree(os.path.dirname(conf_dir), ignore_errors=True)
+            print("Cleaned up Hadoop configuration directory.")
+        if script_path and os.path.exists(script_path):
+            shutil.rmtree(os.path.dirname(script_path), ignore_errors=True)
+            print("Cleaned up Spark script directory.")
 
 
 with DAG(
@@ -296,47 +300,4 @@ with DAG(
     tags=["spark", "yarn", "cdp", "cloudera"],
 ) as dag:
 
-    #
-    # Download the latest Hadoop/YARN client configuration from
-    # Cloudera Manager using REST API auto-discovery.
-    #
-    conf_dir = download_client_config()
-
-    #
-    # Dynamically generate the Spark application script on the Airflow worker.
-    #
-    script_path = generate_spark_script()
-
-    #
-    # Submit the Spark application.
-    #
-    # SparkSubmitOperator uses the Hadoop configuration downloaded
-    # in the previous task via HADOOP_CONF_DIR and YARN_CONF_DIR.
-    # Neither Hadoop configuration nor Spark script files are stored in Git.
-    #
-    spark_submit = SparkSubmitOperator(
-        task_id="spark_submit",
-
-        # Spark application to execute (dynamically generated at runtime)
-        application=script_path,
-
-        # Airflow Spark connection
-        conn_id="spark_yarn",
-
-        deploy_mode="cluster",
-
-        env_vars={
-            "HADOOP_CONF_DIR": "{{ ti.xcom_pull(task_ids='download_client_config') }}",
-            "YARN_CONF_DIR": "{{ ti.xcom_pull(task_ids='download_client_config') }}",
-        },
-
-        conf={
-            "spark.master": "yarn",
-        },
-
-        verbose=True,
-    )
-
-    cleanup_task = cleanup(conf_dir, script_path)
-
-    [conf_dir, script_path] >> spark_submit >> cleanup_task
+    run_spark_on_yarn()
