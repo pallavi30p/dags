@@ -6,20 +6,19 @@ DAG: spark_on_yarn_and_download_client_config
 Purpose
 -------
 Submit a Spark application to a CDP Base Spark-on-YARN cluster without storing
-Hadoop/YARN client configuration files or Spark scripts in the DAG repository.
+Hadoop/YARN client configuration files, Spark binaries, or Spark scripts 
+in the DAG repository or Airflow worker image.
 
-At runtime this DAG:
+At runtime this single-task DAG:
 
 1. Downloads the latest YARN Client Configuration ZIP from Cloudera Manager using
-   the official REST API auto-discovery mechanism.
-2. Extracts it into a temporary directory.
-3. Dynamically generates the PySpark application script (pi.py) in a temp location.
-4. Sets HADOOP_CONF_DIR and YARN_CONF_DIR for Spark.
-5. Submits a Spark application using SparkSubmitOperator.
-6. Cleans up temporary files and directories after execution.
-
-This approach ensures the DAG always uses the latest client configuration from
-Cloudera Manager and remains completely self-contained in a single file.
+   REST API auto-discovery.
+2. Auto-downloads Apache Spark 3.5.4 client binaries tarball to /tmp if 'spark-submit' 
+   is not present in the local container image.
+3. Dynamically generates the PySpark application script (pi.py) locally in /tmp.
+4. Executes SparkSubmitHook in the local container with HADOOP_CONF_DIR pointing
+   to the downloaded Cloudera configuration.
+5. Cleans up temporary configuration and script files upon completion.
 ===============================================================================
 Airflow Connection #1 (Required)
 ===============================================================================
@@ -59,13 +58,7 @@ Host
     yarn
 Extra
 {
-    "deploy-mode": "cluster",
-    "spark_binary": "/opt/spark/bin/spark-submit"
-}
-Example
-{
-    "deploy-mode": "cluster",
-    "spark_binary": "/opt/spark-3.5.4/bin/spark-submit"
+    "deploy-mode": "cluster"
 }
 
 ===============================================================================
@@ -76,45 +69,28 @@ dags/
 │
 └── spark_on_yarn_dag.py
 
-No Hadoop/YARN configuration files or external PySpark scripts are required 
-in the repository.
+No Hadoop/YARN configuration files, Spark binaries, or external PySpark 
+scripts are required in the repository.
 
 ===============================================================================
 Execution Flow
 ===============================================================================
 
-download_client_config          generate_spark_script
-          │                               │
-          │  (Extracts to /tmp)           │  (Writes /tmp/spark-app-xxx/pi.py)
-          └───────────────┬───────────────┘
-                          │
-                          ▼
-                 SparkSubmitOperator
-                          │
-                          ▼
-             cleanup temporary resources
+                 run_spark_on_yarn (Single Task)
+                                │
+   ┌────────────────────────────┼────────────────────────────┐
+   ▼                            ▼                            ▼
+Download CM          Ensure Spark Binaries           Generate Local 
+Client Config           (Download to /tmp)           PySpark Script
+   │                            │                            │
+   └────────────────────────────┼────────────────────────────┘
+                                │
+                                ▼
+                        SparkSubmitHook
+                                │
+                                ▼
+                   Cleanup Temporary Resources
 
-===============================================================================
-"""
-"""
-===============================================================================
-DAG: spark_on_yarn_and_download_client_config
-===============================================================================
-
-Purpose
--------
-Submit a Spark application to a CDP Base Spark-on-YARN cluster without storing
-Hadoop/YARN client configuration files or Spark scripts in the DAG repository.
-
-At runtime this single-task DAG:
-
-1. Downloads the latest YARN Client Configuration ZIP from Cloudera Manager using
-   REST API auto-discovery.
-2. Extracts it into a temporary directory in the local container.
-3. Dynamically generates the PySpark application script (pi.py) locally.
-4. Auto-detects the local 'spark-submit' binary path.
-5. Executes SparkSubmitHook in the same container with local HADOOP_CONF_DIR.
-6. Cleans up all temporary files and directories upon completion.
 ===============================================================================
 """
 
@@ -141,7 +117,7 @@ def _download_client_config() -> str:
     zip_path = os.path.join(tmp_dir, "client-config.zip")
 
     verify = True
-    extra = conn.extra_dejson
+    extra = conn.extra_dejson or {}
 
     if "ca_cert_base64" in extra:
         cert_path = os.path.join(tmp_dir, "cm-ca.pem")
@@ -212,8 +188,55 @@ def _download_client_config() -> str:
     return conf_dir
 
 
+def _ensure_spark_binary() -> str:
+    """Check for system spark-submit; download Spark tarball to /tmp if missing."""
+    # 1. Check system PATH or standard locations
+    for cmd in ["spark-submit", "spark3-submit"]:
+        path_binary = shutil.which(cmd)
+        if path_binary:
+            print(f"Found system Spark binary at: {path_binary}")
+            return path_binary
+
+    # 2. Check standard container locations
+    for path in ["/opt/spark/bin/spark-submit", "/usr/bin/spark-submit"]:
+        if os.path.exists(path):
+            print(f"Found static Spark binary at: {path}")
+            return path
+
+    # 3. Dynamic Download fallback
+    tmp_spark_dir = "/tmp/spark_client"
+    spark_submit_path = os.path.join(tmp_spark_dir, "spark-3.5.4-bin-hadoop3", "bin", "spark-submit")
+
+    if os.path.exists(spark_submit_path):
+        print(f"Using previously cached Spark binary at: {spark_submit_path}")
+        return spark_submit_path
+
+    print("spark-submit not found in container image. Downloading Apache Spark 3.5.4 binaries to /tmp...")
+    os.makedirs(tmp_spark_dir, exist_ok=True)
+    tgz_path = os.path.join(tmp_spark_dir, "spark.tgz")
+
+    url = "https://archive.apache.org/dist/spark/spark-3.5.4/spark-3.5.4-bin-hadoop3.tgz"
+    response = requests.get(url, stream=True, timeout=300)
+    response.raise_for_status()
+
+    with open(tgz_path, "wb") as f:
+        for chunk in response.iter_content(chunk_size=8192):
+            f.write(chunk)
+
+    print("Unpacking Spark client archive...")
+    shutil.unpack_archive(tgz_path, tmp_spark_dir)
+    os.remove(tgz_path)
+
+    # Ensure binary executable permission
+    st = os.stat(spark_submit_path)
+    os.chmod(spark_submit_path, st.st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+
+    print(f"Successfully prepared Spark binary at {spark_submit_path}")
+    return spark_submit_path
+
+
 def _generate_spark_script() -> str:
-    """Generate PySpark script in local container /tmp."""
+    """Generate PySpark application script in local container /tmp."""
     tmp_dir = tempfile.mkdtemp(prefix="spark-app-")
     script_path = os.path.join(tmp_dir, "pi.py")
 
@@ -243,66 +266,24 @@ if __name__ == "__main__":
     return script_path
 
 
-def _resolve_spark_binary(configured_binary: str) -> str:
-    """Check if configured binary exists; otherwise auto-locate spark-submit."""
-    if configured_binary and os.path.exists(configured_binary):
-        return configured_binary
-
-    # Check system PATH
-    path_binary = shutil.which("spark-submit")
-    if path_binary:
-        print(f"Configured binary '{configured_binary}' not found. Found spark-submit on PATH: {path_binary}")
-        return path_binary
-
-    # Check common fallback locations
-    candidates = [
-        "/opt/spark/bin/spark-submit",
-        "/usr/bin/spark-submit",
-        "/usr/local/bin/spark-submit",
-        "/opt/spark-3.5.4/bin/spark-submit",
-    ]
-    for candidate in candidates:
-        if os.path.exists(candidate):
-            print(f"Configured binary '{configured_binary}' not found. Using auto-discovered binary: {candidate}")
-            return candidate
-
-    raise FileNotFoundError(
-        f"Could not locate 'spark-submit'. Configured path '{configured_binary}' does not exist "
-        f"and 'spark-submit' was not found on PATH or in standard paths (/opt/spark/bin/spark-submit, /usr/bin/spark-submit)."
-    )
-
-
 @task
 def run_spark_on_yarn():
     """
-    Unified task that downloads configuration, generates script, and runs 
-    SparkSubmitHook within the exact same container context.
+    Unified task that downloads configuration, downloads Spark binaries if needed, 
+    generates script, and runs SparkSubmitHook in the local container context.
     """
     conf_dir = None
     script_path = None
 
     try:
-        # Step 1: Download client config
+        # Step 1: Download client config from Cloudera Manager
         conf_dir = _download_client_config()
 
-        # Step 2: Generate Spark script
+        # Step 2: Ensure spark-submit is available
+        spark_binary = _ensure_spark_binary()
+
+        # Step 3: Generate PySpark application script
         script_path = _generate_spark_script()
-
-        # Step 3: Resolve Spark binary path & permissions
-        spark_conn = BaseHook.get_connection("spark_yarn")
-        spark_extra = spark_conn.extra_dejson or {}
-        configured_binary = spark_extra.get("spark_binary", "spark-submit")
-
-        spark_binary = _resolve_spark_binary(configured_binary)
-
-        if os.path.isabs(spark_binary) and os.path.exists(spark_binary):
-            if not os.access(spark_binary, os.X_OK):
-                try:
-                    st = os.stat(spark_binary)
-                    os.chmod(spark_binary, st.st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
-                    print(f"Granted execute permissions to {spark_binary}")
-                except Exception as e:
-                    print(f"Warning: Could not grant execution permission on {spark_binary}: {e}")
 
         # Step 4: Execute Spark submission using SparkSubmitHook
         print(f"Submitting Spark job to YARN using binary: {spark_binary}")
@@ -323,7 +304,7 @@ def run_spark_on_yarn():
         spark_hook.submit(application=script_path)
 
     finally:
-        # Step 5: Cleanup local files
+        # Step 5: Cleanup local config & application script
         if conf_dir:
             shutil.rmtree(os.path.dirname(conf_dir), ignore_errors=True)
             print("Cleaned up Hadoop configuration directory.")
@@ -334,7 +315,7 @@ def run_spark_on_yarn():
 
 with DAG(
     dag_id="spark_on_yarn_dag",
-    description="Submit Spark jobs to CDP Base Spark-on-YARN using runtime-downloaded client configuration",
+    description="Submit Spark jobs to CDP Base Spark-on-YARN using runtime-downloaded client configuration and binaries",
     start_date=datetime(2026, 1, 1),
     schedule=None,
     catchup=False,
