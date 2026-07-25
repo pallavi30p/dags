@@ -112,8 +112,9 @@ At runtime this single-task DAG:
    REST API auto-discovery.
 2. Extracts it into a temporary directory in the local container.
 3. Dynamically generates the PySpark application script (pi.py) locally.
-4. Executes SparkSubmitHook in the same container with local HADOOP_CONF_DIR.
-5. Cleans up all temporary files and directories upon completion.
+4. Auto-detects the local 'spark-submit' binary path.
+5. Executes SparkSubmitHook in the same container with local HADOOP_CONF_DIR.
+6. Cleans up all temporary files and directories upon completion.
 ===============================================================================
 """
 
@@ -242,6 +243,35 @@ if __name__ == "__main__":
     return script_path
 
 
+def _resolve_spark_binary(configured_binary: str) -> str:
+    """Check if configured binary exists; otherwise auto-locate spark-submit."""
+    if configured_binary and os.path.exists(configured_binary):
+        return configured_binary
+
+    # Check system PATH
+    path_binary = shutil.which("spark-submit")
+    if path_binary:
+        print(f"Configured binary '{configured_binary}' not found. Found spark-submit on PATH: {path_binary}")
+        return path_binary
+
+    # Check common fallback locations
+    candidates = [
+        "/opt/spark/bin/spark-submit",
+        "/usr/bin/spark-submit",
+        "/usr/local/bin/spark-submit",
+        "/opt/spark-3.5.4/bin/spark-submit",
+    ]
+    for candidate in candidates:
+        if os.path.exists(candidate):
+            print(f"Configured binary '{configured_binary}' not found. Using auto-discovered binary: {candidate}")
+            return candidate
+
+    raise FileNotFoundError(
+        f"Could not locate 'spark-submit'. Configured path '{configured_binary}' does not exist "
+        f"and 'spark-submit' was not found on PATH or in standard paths (/opt/spark/bin/spark-submit, /usr/bin/spark-submit)."
+    )
+
+
 @task
 def run_spark_on_yarn():
     """
@@ -261,7 +291,9 @@ def run_spark_on_yarn():
         # Step 3: Resolve Spark binary path & permissions
         spark_conn = BaseHook.get_connection("spark_yarn")
         spark_extra = spark_conn.extra_dejson or {}
-        spark_binary = spark_extra.get("spark_binary", "spark-submit")
+        configured_binary = spark_extra.get("spark_binary", "spark-submit")
+
+        spark_binary = _resolve_spark_binary(configured_binary)
 
         if os.path.isabs(spark_binary) and os.path.exists(spark_binary):
             if not os.access(spark_binary, os.X_OK):
@@ -273,7 +305,7 @@ def run_spark_on_yarn():
                     print(f"Warning: Could not grant execution permission on {spark_binary}: {e}")
 
         # Step 4: Execute Spark submission using SparkSubmitHook
-        print("Submitting Spark job to YARN...")
+        print(f"Submitting Spark job to YARN using binary: {spark_binary}")
         spark_hook = SparkSubmitHook(
             conn_id="spark_yarn",
             deploy_mode="cluster",
