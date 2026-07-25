@@ -74,7 +74,7 @@ Repository Layout
 
 dags/
 │
-└── spark_on_yarn__and_download_client_config.py
+└── spark_on_yarn_dag.py
 
 No Hadoop/YARN configuration files or external PySpark scripts are required 
 in the repository.
@@ -161,9 +161,10 @@ def download_client_config() -> str:
     This task:
 
     1. Reads the Cloudera Manager connection (cm_yarn).
-    2. Downloads the latest YARN client configuration ZIP.
+    2. Downloads the latest YARN client configuration ZIP using an HTTP session with 
+       browser headers to avoid CM UI endpoint authorization filters.
     3. Optionally decodes the Base64 CA certificate from the Airflow
-       connection Extra field.
+       connection Extra field for TLS verification.
     4. Extracts the ZIP into a temporary directory.
     5. Returns the extracted configuration directory via XCom.
 
@@ -200,11 +201,21 @@ def download_client_config() -> str:
 
     url = f"{conn.host.rstrip('/')}/client-config"
 
-    response = requests.get(
+    #
+    # Configure session with credentials & browser User-Agent header
+    # so Cloudera Manager UI routes accept programmatic requests.
+    #
+    session = requests.Session()
+    session.auth = (conn.login, conn.password)
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    })
+
+    response = session.get(
         url,
-        auth=(conn.login, conn.password),
         verify=verify,
         timeout=120,
+        allow_redirects=True,
     )
 
     response.raise_for_status()
