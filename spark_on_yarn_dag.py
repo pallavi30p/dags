@@ -112,7 +112,7 @@ At runtime this single-task DAG:
    REST API auto-discovery.
 2. Extracts it into a temporary directory in the local container.
 3. Dynamically generates the PySpark application script (pi.py) locally.
-4. Executes SparkSubmitOperator in the same container with local HADOOP_CONF_DIR.
+4. Executes SparkSubmitHook in the same container with local HADOOP_CONF_DIR.
 5. Cleans up all temporary files and directories upon completion.
 ===============================================================================
 """
@@ -120,6 +120,7 @@ At runtime this single-task DAG:
 import base64
 import os
 import shutil
+import stat
 import tempfile
 import zipfile
 from datetime import datetime
@@ -129,10 +130,7 @@ import requests
 from airflow import DAG
 from airflow.decorators import task
 from airflow.hooks.base import BaseHook
-from airflow.operators.python import get_current_context
-from airflow.providers.apache.spark.operators.spark_submit import (
-    SparkSubmitOperator,
-)
+from airflow.providers.apache.spark.hooks.spark_submit import SparkSubmitHook
 
 
 def _download_client_config() -> str:
@@ -248,9 +246,8 @@ if __name__ == "__main__":
 def run_spark_on_yarn():
     """
     Unified task that downloads configuration, generates script, and runs 
-    SparkSubmitOperator within the exact same container context.
+    SparkSubmitHook within the exact same container context.
     """
-    context = get_current_context()
     conf_dir = None
     script_path = None
 
@@ -261,11 +258,23 @@ def run_spark_on_yarn():
         # Step 2: Generate Spark script
         script_path = _generate_spark_script()
 
-        # Step 3: Execute SparkSubmitOperator in local container
+        # Step 3: Resolve Spark binary path & permissions
+        spark_conn = BaseHook.get_connection("spark_yarn")
+        spark_extra = spark_conn.extra_dejson or {}
+        spark_binary = spark_extra.get("spark_binary", "spark-submit")
+
+        if os.path.isabs(spark_binary) and os.path.exists(spark_binary):
+            if not os.access(spark_binary, os.X_OK):
+                try:
+                    st = os.stat(spark_binary)
+                    os.chmod(spark_binary, st.st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+                    print(f"Granted execute permissions to {spark_binary}")
+                except Exception as e:
+                    print(f"Warning: Could not grant execution permission on {spark_binary}: {e}")
+
+        # Step 4: Execute Spark submission using SparkSubmitHook
         print("Submitting Spark job to YARN...")
-        spark_operator = SparkSubmitOperator(
-            task_id="spark_submit_internal",
-            application=script_path,
+        spark_hook = SparkSubmitHook(
             conn_id="spark_yarn",
             deploy_mode="cluster",
             env_vars={
@@ -275,14 +284,14 @@ def run_spark_on_yarn():
             conf={
                 "spark.master": "yarn",
             },
+            spark_binary=spark_binary,
             verbose=True,
         )
-        
-        # Execute operator directly
-        spark_operator.execute(context)
+
+        spark_hook.submit(application=script_path)
 
     finally:
-        # Step 4: Cleanup local files
+        # Step 5: Cleanup local files
         if conf_dir:
             shutil.rmtree(os.path.dirname(conf_dir), ignore_errors=True)
             print("Cleaned up Hadoop configuration directory.")
