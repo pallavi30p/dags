@@ -1,3 +1,4 @@
+```python
 from airflow import DAG
 from airflow.providers.standard.operators.python import PythonOperator
 from airflow.sdk import Variable, Connection
@@ -6,9 +7,18 @@ import requests
 import urllib3
 
 
-# Suppress SSL warnings for sandbox environments
+# ============================================================
+# Sandbox SSL
+# ============================================================
+
+# Suppress SSL warnings for sandbox environments.
+# For production, use verify=True with the appropriate CA.
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
+
+# ============================================================
+# Default DAG arguments
+# ============================================================
 
 default_args = {
     "owner": "airflow",
@@ -17,129 +27,250 @@ default_args = {
 }
 
 
-def trigger_cai_job_legacy():
+# ============================================================
+# Main function
+# ============================================================
 
-    # =========================================================
-    # 1. Retrieve CAI v1 Legacy configuration
-    # =========================================================
+def trigger_cai_job_v2():
 
-    base_url_legacy = Variable.get("cai_url_legacy").rstrip("/")
-    project_user_legacy = Variable.get("cai_project_user_legacy")
-    project_name_legacy = Variable.get("cai_project_name_legacy")
-    job_id_legacy = Variable.get("cai_job_id_legacy")
+    # --------------------------------------------------------
+    # 1. Read configuration from Airflow Variables
+    # --------------------------------------------------------
+
+    cai_url = Variable.get("cai_url_legacy").rstrip("/")
+    cai_project_name = Variable.get("cai_project_name_legacy")
+    cai_job_name = Variable.get("cai_job_name_legacy")
+
+    print(f"CAI URL: {cai_url}")
+    print(f"CAI Project: {cai_project_name}")
+    print(f"CAI Job: {cai_job_name}")
 
 
-    # =========================================================
-    # 2. Retrieve API key from Airflow Connection
-    # =========================================================
+    # --------------------------------------------------------
+    # 2. Get API key from Airflow Connection
+    # --------------------------------------------------------
 
-    conn_legacy = Connection.get("cai_api_token_legacy")
+    conn = Connection.get("cai_api_token_legacy")
 
-    # For CAI v1:
-    #   Basic Auth username = API Key
-    #   Basic Auth password = empty
-    api_key_legacy = conn_legacy.login
+    api_key = conn.login
 
-    if not api_key_legacy:
+    if not api_key:
         raise ValueError(
-            "CAI legacy API key is missing from "
-            "Airflow Connection 'cai_api_token_legacy'"
+            "CAI API key is missing from Airflow Connection "
+            "'cai_api_token'"
         )
 
-
-    # =========================================================
-    # 3. Build CAI v1 Legacy endpoint
-    # =========================================================
-
-    endpoint_legacy = (
-        f"{base_url_legacy}"
-        f"/api/v1/projects/"
-        f"{project_user_legacy}/"
-        f"{project_name_legacy}/"
-        f"jobs/"
-        f"{job_id_legacy}/"
-        f"start"
-    )
+    print(f"Using CAI API key: {api_key[:8]}... (redacted)")
 
 
-    # =========================================================
-    # 4. Logging (do NOT print the API key)
-    # =========================================================
+    # --------------------------------------------------------
+    # 3. Create HTTP headers
+    # --------------------------------------------------------
 
-    print("CAI Legacy Job Trigger")
-    print(f"Endpoint: {endpoint_legacy}")
-    print(f"Project User: {project_user_legacy}")
-    print(f"Project Name: {project_name_legacy}")
-    print(f"Job ID: {job_id_legacy}")
-    print(f"API Key: {api_key_legacy[:8]}... (redacted)")
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+    }
 
 
-    # =========================================================
-    # 5. Trigger CAI v1 Legacy Job
-    # =========================================================
+    # --------------------------------------------------------
+    # 4. Find project by project name
+    # --------------------------------------------------------
 
-    response_legacy = requests.post(
-        endpoint_legacy,
+    projects_endpoint = f"{cai_url}/api/v2/projects"
 
-        # CAI v1 Legacy authentication
-        # username = API key
-        # password = empty
-        auth=(api_key_legacy, ""),
+    print(f"Looking up project: {cai_project_name}")
 
-        headers={
-            "Content-Type": "application/json",
-        },
-
-        # Empty JSON request body
-        json={},
-
-        # Sandbox certificate
+    project_response = requests.get(
+        projects_endpoint,
+        headers=headers,
         verify=False,
-
         timeout=60,
     )
 
+    print(f"Projects API status: {project_response.status_code}")
 
-    # =========================================================
-    # 6. Process response
-    # =========================================================
+    if project_response.status_code != 200:
+        raise Exception(
+            "Failed to retrieve CAI projects. "
+            f"HTTP {project_response.status_code}: "
+            f"{project_response.text}"
+        )
 
-    print(f"HTTP Status: {response_legacy.status_code}")
-    print(f"Response: {response_legacy.text}")
+    projects_data = project_response.json()
 
+    projects = projects_data.get("projects", [])
 
-    if response_legacy.status_code in (200, 201):
+    matching_projects = [
+        project
+        for project in projects
+        if project.get("name") == cai_project_name
+    ]
 
-        print("CAI legacy job triggered successfully!")
+    if not matching_projects:
+        available_projects = [
+            project.get("name")
+            for project in projects
+        ]
 
-        try:
-            return response_legacy.json()
-        except ValueError:
-            return response_legacy.text
+        raise ValueError(
+            f"CAI project '{cai_project_name}' was not found. "
+            f"Available projects: {available_projects}"
+        )
 
+    if len(matching_projects) > 1:
+        raise ValueError(
+            f"Multiple CAI projects found with name "
+            f"'{cai_project_name}'. Project names must be unique."
+        )
 
-    raise Exception(
-        "CAI Legacy Job Trigger Failed: "
-        f"HTTP {response_legacy.status_code} - "
-        f"{response_legacy.text}"
+    project = matching_projects[0]
+
+    cai_project_id = project["id"]
+
+    print(
+        f"Found project '{cai_project_name}' "
+        f"with ID '{cai_project_id}'"
     )
 
 
-# =============================================================
-# DAG
-# =============================================================
+    # --------------------------------------------------------
+    # 5. Find job by job name
+    # --------------------------------------------------------
+
+    jobs_endpoint = (
+        f"{cai_url}/api/v2/projects/"
+        f"{cai_project_id}/jobs"
+    )
+
+    print(f"Looking up job: {cai_job_name}")
+
+    jobs_response = requests.get(
+        jobs_endpoint,
+        headers=headers,
+        verify=False,
+        timeout=60,
+    )
+
+    print(f"Jobs API status: {jobs_response.status_code}")
+
+    if jobs_response.status_code != 200:
+        raise Exception(
+            "Failed to retrieve CAI jobs. "
+            f"HTTP {jobs_response.status_code}: "
+            f"{jobs_response.text}"
+        )
+
+    jobs_data = jobs_response.json()
+
+    jobs = jobs_data.get("jobs", [])
+
+    matching_jobs = [
+        job
+        for job in jobs
+        if job.get("name") == cai_job_name
+    ]
+
+    if not matching_jobs:
+        available_jobs = [
+            job.get("name")
+            for job in jobs
+        ]
+
+        raise ValueError(
+            f"CAI job '{cai_job_name}' was not found "
+            f"in project '{cai_project_name}'. "
+            f"Available jobs: {available_jobs}"
+        )
+
+    if len(matching_jobs) > 1:
+        raise ValueError(
+            f"Multiple CAI jobs found with name "
+            f"'{cai_job_name}' in project "
+            f"'{cai_project_name}'."
+        )
+
+    job = matching_jobs[0]
+
+    cai_job_id = job["id"]
+
+    print(
+        f"Found job '{cai_job_name}' "
+        f"with ID '{cai_job_id}'"
+    )
+
+
+    # --------------------------------------------------------
+    # 6. Trigger the job
+    # --------------------------------------------------------
+
+    run_endpoint = (
+        f"{cai_url}/api/v2/projects/"
+        f"{cai_project_id}/jobs/"
+        f"{cai_job_id}/runs"
+    )
+
+    print(f"Triggering CAI job...")
+    print(f"Run endpoint: {run_endpoint}")
+
+    run_response = requests.post(
+        run_endpoint,
+        headers=headers,
+        json={},
+        verify=False,
+        timeout=60,
+    )
+
+    print(f"Run API status: {run_response.status_code}")
+    print(f"Run API response: {run_response.text}")
+
+    if run_response.status_code not in (200, 201):
+        raise Exception(
+            "Failed to trigger CAI job. "
+            f"HTTP {run_response.status_code}: "
+            f"{run_response.text}"
+        )
+
+
+    # --------------------------------------------------------
+    # 7. Return run information
+    # --------------------------------------------------------
+
+    try:
+        run_data = run_response.json()
+    except ValueError:
+        run_data = run_response.text
+
+    print(
+        f"Successfully triggered CAI job "
+        f"'{cai_job_name}' in project "
+        f"'{cai_project_name}'"
+    )
+
+    print(f"Project ID: {cai_project_id}")
+    print(f"Job ID: {cai_job_id}")
+    print(f"Run response: {run_data}")
+
+    return run_data
+
+
+# ============================================================
+# DAG definition
+# ============================================================
 
 with DAG(
-    dag_id="cai_cwo_trigger_legacy",
+    dag_id="cai_job_trigger_legacy",
     default_args=default_args,
     schedule=None,
     catchup=False,
-    tags=["cai", "legacy", "integration"],
+    tags=["cai", "v2", "integration"],
 ) as dag:
 
-    run_job_legacy = PythonOperator(
-        task_id="trigger_cai_job_legacy_task",
-        python_callable=trigger_cai_job_legacy,
+    trigger_job = PythonOperator(
+        task_id="trigger_cai_job",
+        python_callable=trigger_cai_job_v2,
     )
 
-    run_job_legacy
+    trigger_job
+```
