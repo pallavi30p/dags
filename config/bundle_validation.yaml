@@ -1,0 +1,6 @@
+validation:
+  source: git-dag-bundle
+  test_name: non-dag-files
+  version: "v1"
+
+message: "SUCCESS: config.yaml was synced from GitDagBundle"
