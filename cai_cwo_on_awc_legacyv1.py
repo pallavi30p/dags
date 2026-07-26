@@ -264,7 +264,7 @@ with DAG(
     default_args=default_args,
     schedule=None,
     catchup=False,
-    tags=["cai", "v2", "integration"],
+    tags=["cai", "v2", "legacy", "integration"],
 ) as dag:
 
     trigger_job = PythonOperator(
