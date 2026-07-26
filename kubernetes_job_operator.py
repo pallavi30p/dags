@@ -1,9 +1,8 @@
 """
 Example DAG that runs a sleep command in a custom container via KubernetesJobOperator.
 
-KubernetesJobOperator is disabled by default in CAF; remove it from
-``airflow.extraConfig.disabledOperators`` before loading this DAG (see
-``docs/cluster_policy.md``).
+KubernetesJobOperator is disabled by default; remove it from
+``airflow.extraConfig.disabledOperators``
 """
 
 from airflow import DAG
