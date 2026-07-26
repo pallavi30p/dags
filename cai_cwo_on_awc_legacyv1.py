@@ -272,4 +272,3 @@ with DAG(
     )
 
     trigger_job
-```
