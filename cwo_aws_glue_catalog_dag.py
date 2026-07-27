@@ -1,40 +1,55 @@
+```python
 """
-CWO - AWS Glue Data Catalog CRUD Integration Test
-==================================================
+CWO - AWS Glue External Catalog + Glue Job Integration Test
+=============================================================
 
 Purpose
 -------
-Validates CWO/Airflow integration with AWS Glue Data Catalog using
-an Airflow-managed AWS Connection.
+This DAG validates CWO/Airflow integration with AWS Glue as an external
+cloud metadata store and workload execution platform.
 
 The DAG performs:
 
-    1. Create database
-    2. Read database
-    3. Create table
-    4. Read table
-    5. List tables
-    6. Update table
-    7. Verify update
-    8. Delete table
-    9. Delete database
+1. AWS Glue Data Catalog CRUD:
+   - Create a database with a dynamic suffix
+   - Get the database
+   - Create a table
+   - Get the table
+   - Update the table
+   - Verify the update
+   - Delete the table
+   - Delete the database
 
-Dynamic resource naming
------------------------
-A unique suffix is generated for every DAG run.
+2. AWS Glue external workload execution:
+   - Trigger an already-created AWS Glue Job
+   - Monitor the Glue Job until it reaches a terminal state
+   - Fail the Airflow task if the Glue Job fails
 
-Example:
+Architecture
+------------
 
-    cwo_test_db_20260727_064512
-    cwo_test_table_20260727_064512
+                 CWO / Airflow
+                       |
+                aws_glue_conn
+                       |
+             +---------+---------+
+             |                   |
+             v                   v
+      AWS Glue Catalog      AWS Glue Job
+             |                   |
+       Database CRUD        Start + Monitor
+             |                   |
+          Table CRUD         S3 Python script
+                                 |
+                                 v
+                 s3://qe-s3-bucket-weekly/cwo/cwo/
+                       glue-test/cwo_glue_test.py
 
-This prevents collisions when:
-    - the DAG is manually triggered multiple times
-    - multiple DAG runs execute
-    - a previous run did not clean up successfully
 
 Airflow Connection
 ------------------
+Create this manually in the Airflow/CWO environment:
+
 Connection ID:
     aws_glue_conn
 
@@ -52,36 +67,53 @@ Extra:
         "region_name": "us-west-2"
     }
 
-AWS permissions required
-------------------------
-    glue:CreateDatabase
-    glue:GetDatabase
-    glue:DeleteDatabase
+The AWS credentials used by this connection must be able to perform
+the Glue Catalog CRUD operations and start/monitor the Glue Job.
 
-    glue:CreateTable
-    glue:GetTable
-    glue:GetTables
-    glue:UpdateTable
-    glue:DeleteTable
+AWS Glue Job
+------------
+The following Glue Job must already exist:
 
-AWS region
-----------
-    us-west-2
+    cwo-glue-external-job
 
-Important
----------
-AWS credentials are NOT stored in this DAG.
-They are retrieved from the Airflow Connection.
+It should point to:
 
-The DAG only operates on dynamically generated test resources.
-Existing resources such as "iceberg_data" are not modified.
+    s3://qe-s3-bucket-weekly/cwo/cwo/glue-test/cwo_glue_test.py
+
+Glue execution role:
+
+    AmazonSageMakerServiceCatalogProductsGlueRole
+
+The execution role must be able to read objects from:
+
+    s3://qe-s3-bucket-weekly/*
+
+Airflow Variables
+-----------------
+Optional:
+
+    cwo_glue_job_name
+        Default:
+            cwo-glue-external-job
+
+The database name is generated dynamically by the DAG, so multiple
+runs do not collide with an existing database.
+
+Provider Requirement
+--------------------
+Requires apache-airflow-providers-amazon with:
+
+    airflow.providers.amazon.aws.hooks.glue.GlueCatalogHook
+    airflow.providers.amazon.aws.operators.glue.GlueJobOperator
 """
 
 from datetime import datetime
 
 from airflow import DAG
+from airflow.models import Variable
 from airflow.operators.python import PythonOperator
-from airflow.providers.amazon.aws.hooks.base_aws import AwsBaseHook
+from airflow.providers.amazon.aws.hooks.glue_catalog import GlueCatalogHook
+from airflow.providers.amazon.aws.operators.glue import GlueJobOperator
 
 
 # ---------------------------------------------------------------------------
@@ -91,412 +123,304 @@ from airflow.providers.amazon.aws.hooks.base_aws import AwsBaseHook
 AWS_CONN_ID = "aws_glue_conn"
 AWS_REGION = "us-west-2"
 
+GLUE_JOB_NAME = Variable.get(
+    "cwo_glue_job_name",
+    default_var="cwo-glue-external-job",
+)
 
-# ---------------------------------------------------------------------------
-# Dynamic resource names
-# ---------------------------------------------------------------------------
-
-def get_resource_names(**context):
-    """
-    Generate unique Glue database/table names for this DAG run.
-
-    The execution timestamp is used instead of the full Airflow run_id
-    because Glue resource names have naming restrictions and we want
-    predictable, short names.
-    """
-
-    logical_date = context["logical_date"]
-
-    suffix = logical_date.strftime("%Y%m%d_%H%M%S")
-
-    database_name = f"cwo_test_db_{suffix}"
-    table_name = f"cwo_test_table_{suffix}"
-
-    print(f"Glue database: {database_name}")
-    print(f"Glue table:    {table_name}")
-
-    return {
-        "database": database_name,
-        "table": table_name,
-    }
+# Base names. A timestamp is added at runtime.
+DB_BASE_NAME = "cwo_glue_test_db"
+TABLE_NAME = "cwo_test_table"
 
 
 # ---------------------------------------------------------------------------
-# AWS Glue client
+# Helper functions
 # ---------------------------------------------------------------------------
 
-def get_glue_client():
+def get_runtime_names(**context):
     """
-    Create a boto3 Glue client using the Airflow AWS Connection.
+    Generate unique database/table names for this DAG run.
 
-    AWS credentials are retrieved from:
-        aws_glue_conn
+    The database gets a timestamp suffix so repeated DAG runs do not
+    conflict with previous runs.
     """
+    ts = datetime.utcnow().strftime("%Y%m%d%H%M%S")
 
-    hook = AwsBaseHook(
+    db_name = f"{DB_BASE_NAME}_{ts}"
+
+    context["ti"].xcom_push(
+        key="db_name",
+        value=db_name,
+    )
+
+    context["ti"].xcom_push(
+        key="table_name",
+        value=TABLE_NAME,
+    )
+
+    print(f"Database: {db_name}")
+    print(f"Table:    {TABLE_NAME}")
+
+
+def create_database(**context):
+    """
+    Create an AWS Glue Data Catalog database.
+    """
+    hook = GlueCatalogHook(
         aws_conn_id=AWS_CONN_ID,
-        client_type="glue",
         region_name=AWS_REGION,
     )
 
-    return hook.get_conn()
-
-
-# ---------------------------------------------------------------------------
-# Create database
-# ---------------------------------------------------------------------------
-
-def create_database(**context):
-    """Create a dynamically named Glue database."""
-
-    glue = get_glue_client()
-
-    names = context["ti"].xcom_pull(
-        task_ids="generate_resource_names"
+    db_name = context["ti"].xcom_pull(
+        task_ids="generate_runtime_names",
+        key="db_name",
     )
 
-    database_name = names["database"]
-
-    print(f"Creating Glue database: {database_name}")
-
-    glue.create_database(
-        DatabaseInput={
-            "Name": database_name,
-            "Description": (
-                "CWO AWS Glue CRUD integration test"
-            ),
-            "Parameters": {
-                "created_by": "cwo-airflow",
-                "test": "true",
-            },
-        }
+    hook.create_database(
+        database_name=db_name,
+        description="CWO AWS Glue external catalog integration test",
     )
 
-    print(f"Successfully created: {database_name}")
+    print(f"Created Glue database: {db_name}")
 
-
-# ---------------------------------------------------------------------------
-# Get database
-# ---------------------------------------------------------------------------
 
 def get_database(**context):
-    """Read and verify the dynamically created Glue database."""
-
-    glue = get_glue_client()
-
-    names = context["ti"].xcom_pull(
-        task_ids="generate_resource_names"
+    """
+    Read the database from AWS Glue Data Catalog.
+    """
+    hook = GlueCatalogHook(
+        aws_conn_id=AWS_CONN_ID,
+        region_name=AWS_REGION,
     )
 
-    database_name = names["database"]
-
-    response = glue.get_database(
-        Name=database_name
+    db_name = context["ti"].xcom_pull(
+        task_ids="generate_runtime_names",
+        key="db_name",
     )
 
-    database = response["Database"]
+    database = hook.get_database(
+        database_name=db_name,
+    )
 
-    print("Successfully retrieved Glue database")
-    print(f"Name:        {database['Name']}")
-    print(f"Description: {database.get('Description')}")
-    print(f"Catalog ID:  {database.get('CatalogId')}")
+    print(f"Retrieved Glue database: {database}")
 
-    assert database["Name"] == database_name
-
-
-# ---------------------------------------------------------------------------
-# Create table
-# ---------------------------------------------------------------------------
 
 def create_table(**context):
-    """Create a dynamically named Glue table."""
-
-    glue = get_glue_client()
-
-    names = context["ti"].xcom_pull(
-        task_ids="generate_resource_names"
+    """
+    Create a table in the dynamically generated Glue database.
+    """
+    hook = GlueCatalogHook(
+        aws_conn_id=AWS_CONN_ID,
+        region_name=AWS_REGION,
     )
 
-    database_name = names["database"]
-    table_name = names["table"]
-
-    print(
-        f"Creating Glue table: "
-        f"{database_name}.{table_name}"
+    db_name = context["ti"].xcom_pull(
+        task_ids="generate_runtime_names",
+        key="db_name",
     )
 
-    glue.create_table(
-        DatabaseName=database_name,
-        TableInput={
-            "Name": table_name,
-            "Description": (
-                "CWO AWS Glue CRUD integration test table"
-            ),
-            "TableType": "EXTERNAL_TABLE",
-            "Parameters": {
-                "created_by": "cwo-airflow",
-                "test": "true",
-                "version": "1",
-            },
-            "StorageDescriptor": {
-                "Columns": [
-                    {
-                        "Name": "id",
-                        "Type": "int",
-                    },
-                    {
-                        "Name": "name",
-                        "Type": "string",
-                    },
-                ],
-                "Location": "s3://cwo-glue-test-placeholder/",
-            },
+    table_name = context["ti"].xcom_pull(
+        task_ids="generate_runtime_names",
+        key="table_name",
+    )
+
+    table_input = {
+        "Name": table_name,
+        "Description": "CWO AWS Glue CRUD integration test table",
+        "TableType": "EXTERNAL_TABLE",
+        "Parameters": {
+            "created_by": "cwo-airflow",
+            "test": "aws-glue-crud",
         },
+        "StorageDescriptor": {
+            "Columns": [
+                {
+                    "Name": "id",
+                    "Type": "int",
+                },
+                {
+                    "Name": "name",
+                    "Type": "string",
+                },
+            ],
+            "Location": "s3://qe-s3-bucket-weekly/cwo/cwo/",
+        },
+    }
+
+    hook.create_table(
+        database_name=db_name,
+        table_input=table_input,
     )
 
-    print(
-        f"Successfully created: "
-        f"{database_name}.{table_name}"
-    )
+    print(f"Created Glue table: {db_name}.{table_name}")
 
-
-# ---------------------------------------------------------------------------
-# Get table
-# ---------------------------------------------------------------------------
 
 def get_table(**context):
-    """Read and verify the Glue table."""
-
-    glue = get_glue_client()
-
-    names = context["ti"].xcom_pull(
-        task_ids="generate_resource_names"
+    """
+    Retrieve the Glue table and verify that it exists.
+    """
+    hook = GlueCatalogHook(
+        aws_conn_id=AWS_CONN_ID,
+        region_name=AWS_REGION,
     )
 
-    database_name = names["database"]
-    table_name = names["table"]
-
-    response = glue.get_table(
-        DatabaseName=database_name,
-        Name=table_name,
+    db_name = context["ti"].xcom_pull(
+        task_ids="generate_runtime_names",
+        key="db_name",
     )
 
-    table = response["Table"]
-
-    print("Successfully retrieved Glue table")
-    print(f"Database:    {table['DatabaseName']}")
-    print(f"Table:       {table['Name']}")
-    print(f"Description: {table.get('Description')}")
-    print(f"Parameters:  {table.get('Parameters')}")
-    print(
-        f"Columns:     "
-        f"{table['StorageDescriptor']['Columns']}"
+    table_name = context["ti"].xcom_pull(
+        task_ids="generate_runtime_names",
+        key="table_name",
     )
 
-    assert table["Name"] == table_name
-    assert table["DatabaseName"] == database_name
-
-
-# ---------------------------------------------------------------------------
-# Get tables
-# ---------------------------------------------------------------------------
-
-def get_tables(**context):
-    """List tables in the dynamically created database."""
-
-    glue = get_glue_client()
-
-    names = context["ti"].xcom_pull(
-        task_ids="generate_resource_names"
+    table = hook.get_table(
+        database_name=db_name,
+        table_name=table_name,
     )
 
-    database_name = names["database"]
-    table_name = names["table"]
+    print(f"Retrieved Glue table: {table}")
 
-    response = glue.get_tables(
-        DatabaseName=database_name
-    )
-
-    tables = response.get("TableList", [])
-
-    table_names = [
-        table["Name"]
-        for table in tables
-    ]
-
-    print(
-        f"Tables in {database_name}: "
-        f"{table_names}"
-    )
-
-    assert table_name in table_names
-
-
-# ---------------------------------------------------------------------------
-# Update table
-# ---------------------------------------------------------------------------
 
 def update_table(**context):
-    """Update the dynamically created Glue table."""
-
-    glue = get_glue_client()
-
-    names = context["ti"].xcom_pull(
-        task_ids="generate_resource_names"
+    """
+    Update table metadata in the Glue Data Catalog.
+    """
+    hook = GlueCatalogHook(
+        aws_conn_id=AWS_CONN_ID,
+        region_name=AWS_REGION,
     )
 
-    database_name = names["database"]
-    table_name = names["table"]
-
-    print(
-        f"Updating Glue table: "
-        f"{database_name}.{table_name}"
+    db_name = context["ti"].xcom_pull(
+        task_ids="generate_runtime_names",
+        key="db_name",
     )
 
-    glue.update_table(
-        DatabaseName=database_name,
-        TableInput={
-            "Name": table_name,
-            "Description": (
-                "UPDATED by CWO AWS Glue CRUD integration test"
-            ),
-            "TableType": "EXTERNAL_TABLE",
-            "Parameters": {
-                "created_by": "cwo-airflow",
-                "test": "true",
-                "version": "2",
-                "updated": "true",
-            },
-            "StorageDescriptor": {
-                "Columns": [
-                    {
-                        "Name": "id",
-                        "Type": "int",
-                    },
-                    {
-                        "Name": "name",
-                        "Type": "string",
-                    },
-                    {
-                        "Name": "email",
-                        "Type": "string",
-                    },
-                ],
-                "Location": "s3://cwo-glue-test-placeholder/",
-            },
+    table_name = context["ti"].xcom_pull(
+        task_ids="generate_runtime_names",
+        key="table_name",
+    )
+
+    table_input = {
+        "Name": table_name,
+        "Description": "UPDATED by CWO AWS Glue integration test",
+        "TableType": "EXTERNAL_TABLE",
+        "Parameters": {
+            "created_by": "cwo-airflow",
+            "test": "aws-glue-crud",
+            "updated_by": "cwo-airflow",
+            "update_test": "passed",
         },
+        "StorageDescriptor": {
+            "Columns": [
+                {
+                    "Name": "id",
+                    "Type": "int",
+                },
+                {
+                    "Name": "name",
+                    "Type": "string",
+                },
+                {
+                    "Name": "updated",
+                    "Type": "string",
+                },
+            ],
+            "Location": "s3://qe-s3-bucket-weekly/cwo/cwo/",
+        },
+    }
+
+    hook.update_table(
+        database_name=db_name,
+        table_input=table_input,
     )
 
-    print(
-        f"Successfully updated: "
-        f"{database_name}.{table_name}"
-    )
+    print(f"Updated Glue table: {db_name}.{table_name}")
 
-
-# ---------------------------------------------------------------------------
-# Verify update
-# ---------------------------------------------------------------------------
 
 def verify_updated_table(**context):
-    """Verify the table update."""
-
-    glue = get_glue_client()
-
-    names = context["ti"].xcom_pull(
-        task_ids="generate_resource_names"
+    """
+    Verify that the table update is visible through the Glue Catalog.
+    """
+    hook = GlueCatalogHook(
+        aws_conn_id=AWS_CONN_ID,
+        region_name=AWS_REGION,
     )
 
-    database_name = names["database"]
-    table_name = names["table"]
-
-    response = glue.get_table(
-        DatabaseName=database_name,
-        Name=table_name,
+    db_name = context["ti"].xcom_pull(
+        task_ids="generate_runtime_names",
+        key="db_name",
     )
 
-    table = response["Table"]
-
-    print(f"Description: {table.get('Description')}")
-    print(f"Parameters:  {table.get('Parameters')}")
-
-    columns = table["StorageDescriptor"]["Columns"]
-
-    print(f"Columns: {columns}")
-
-    assert (
-        table["Description"]
-        == "UPDATED by CWO AWS Glue CRUD integration test"
+    table_name = context["ti"].xcom_pull(
+        task_ids="generate_runtime_names",
+        key="table_name",
     )
 
-    assert table["Parameters"]["version"] == "2"
-    assert table["Parameters"]["updated"] == "true"
+    table = hook.get_table(
+        database_name=db_name,
+        table_name=table_name,
+    )
 
-    column_names = [
-        column["Name"]
-        for column in columns
-    ]
+    print(f"Updated table metadata: {table}")
 
-    assert "email" in column_names
+    parameters = table.get("Parameters", {})
 
-    print("Table update verification successful")
+    if parameters.get("update_test") != "passed":
+        raise RuntimeError(
+            "Glue table update verification failed. "
+            f"Parameters received: {parameters}"
+        )
 
+    print("Glue table update verified successfully.")
 
-# ---------------------------------------------------------------------------
-# Delete table
-# ---------------------------------------------------------------------------
 
 def delete_table(**context):
-    """Delete the dynamically created Glue table."""
-
-    glue = get_glue_client()
-
-    names = context["ti"].xcom_pull(
-        task_ids="generate_resource_names"
+    """
+    Delete the test table.
+    """
+    hook = GlueCatalogHook(
+        aws_conn_id=AWS_CONN_ID,
+        region_name=AWS_REGION,
     )
 
-    database_name = names["database"]
-    table_name = names["table"]
-
-    print(
-        f"Deleting Glue table: "
-        f"{database_name}.{table_name}"
+    db_name = context["ti"].xcom_pull(
+        task_ids="generate_runtime_names",
+        key="db_name",
     )
 
-    glue.delete_table(
-        DatabaseName=database_name,
-        Name=table_name,
+    table_name = context["ti"].xcom_pull(
+        task_ids="generate_runtime_names",
+        key="table_name",
     )
 
-    print(
-        f"Successfully deleted: "
-        f"{database_name}.{table_name}"
+    hook.delete_table(
+        database_name=db_name,
+        table_name=table_name,
     )
 
+    print(f"Deleted Glue table: {db_name}.{table_name}")
 
-# ---------------------------------------------------------------------------
-# Delete database
-# ---------------------------------------------------------------------------
 
 def delete_database(**context):
-    """Delete the dynamically created Glue database."""
-
-    glue = get_glue_client()
-
-    names = context["ti"].xcom_pull(
-        task_ids="generate_resource_names"
+    """
+    Delete the dynamically generated Glue database.
+    """
+    hook = GlueCatalogHook(
+        aws_conn_id=AWS_CONN_ID,
+        region_name=AWS_REGION,
     )
 
-    database_name = names["database"]
-
-    print(f"Deleting Glue database: {database_name}")
-
-    glue.delete_database(
-        Name=database_name
+    db_name = context["ti"].xcom_pull(
+        task_ids="generate_runtime_names",
+        key="db_name",
     )
 
-    print(
-        f"Successfully deleted: {database_name}"
+    hook.delete_database(
+        database_name=db_name,
     )
+
+    print(f"Deleted Glue database: {db_name}")
 
 
 # ---------------------------------------------------------------------------
@@ -504,10 +428,10 @@ def delete_database(**context):
 # ---------------------------------------------------------------------------
 
 with DAG(
-    dag_id="cwo_aws_glue_catalog_crud",
+    dag_id="cwo_aws_glue_external_catalog_and_job",
     description=(
-        "CWO AWS Glue Data Catalog CRUD integration test "
-        "with dynamically generated resources"
+        "CWO AWS Glue Data Catalog CRUD plus external Glue Job "
+        "trigger and monitoring test"
     ),
     start_date=datetime(2026, 1, 1),
     schedule=None,
@@ -516,15 +440,14 @@ with DAG(
         "cwo",
         "aws",
         "glue",
-        "metadata-store",
-        "crud",
-        "external-platform",
+        "external-catalog",
+        "external-job",
     ],
 ) as dag:
 
-    generate_names = PythonOperator(
-        task_id="generate_resource_names",
-        python_callable=get_resource_names,
+    generate_runtime_names = PythonOperator(
+        task_id="generate_runtime_names",
+        python_callable=get_runtime_names,
     )
 
     create_db = PythonOperator(
@@ -547,11 +470,6 @@ with DAG(
         python_callable=get_table,
     )
 
-    list_tbls = PythonOperator(
-        task_id="get_tables",
-        python_callable=get_tables,
-    )
-
     update_tbl = PythonOperator(
         task_id="update_table",
         python_callable=update_table,
@@ -560,6 +478,25 @@ with DAG(
     verify_update = PythonOperator(
         task_id="verify_updated_table",
         python_callable=verify_updated_table,
+    )
+
+    # -----------------------------------------------------------------------
+    # Trigger the existing AWS Glue Job.
+    #
+    # The Glue Job itself already points to:
+    #
+    # s3://qe-s3-bucket-weekly/cwo/cwo/glue-test/cwo_glue_test.py
+    #
+    # Airflow starts the job and waits until Glue reports a terminal state.
+    # -----------------------------------------------------------------------
+
+    run_external_glue_job = GlueJobOperator(
+        task_id="run_external_glue_job",
+        job_name=GLUE_JOB_NAME,
+        aws_conn_id=AWS_CONN_ID,
+        region_name=AWS_REGION,
+        wait_for_completion=True,
+        verbose=True,
     )
 
     delete_tbl = PythonOperator(
@@ -573,18 +510,19 @@ with DAG(
     )
 
     # -----------------------------------------------------------------------
-    # DAG execution order
+    # Execution order
     # -----------------------------------------------------------------------
 
     (
-        generate_names
+        generate_runtime_names
         >> create_db
         >> get_db
         >> create_tbl
         >> get_tbl
-        >> list_tbls
         >> update_tbl
         >> verify_update
+        >> run_external_glue_job
         >> delete_tbl
         >> delete_db
     )
+```
