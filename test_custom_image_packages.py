@@ -44,6 +44,7 @@ def custom_image_verification():
         These dependencies are installed separately from the base Airflow image
         using the packages defined in custom-requirements.txt.
         """
+
         custom_modules = [
             ("DuckDB", "duckdb"),
             ("PyMuPDF (Fitz)", "fitz"),
@@ -56,25 +57,30 @@ def custom_image_verification():
         results = []
         failed = False
 
-        print("=== CHECKING CUSTOM PACKAGES ===")
+        print("\n=== CHECKING CUSTOM PACKAGES ===")
 
         for name, module_name in custom_modules:
             try:
                 mod = importlib.import_module(module_name)
+
                 version = getattr(mod, "__version__", "Present")
+
                 msg = (
                     f"✅ SUCCESS: {name} ({module_name}) "
                     f"-> Version: {version}"
                 )
+
                 print(msg)
                 results.append(msg)
 
             except ImportError as e:
                 failed = True
+
                 msg = (
                     f"❌ FAILED: {name} ({module_name}) "
                     f"-> Error: {str(e)}"
                 )
+
                 print(msg)
                 results.append(msg)
 
@@ -86,39 +92,86 @@ def custom_image_verification():
 
     @task
     def check_base_providers():
-        """Verify standard providers expected to be available in the base CWO image."""
+        """
+        Verify standard providers expected to be available in the base
+        CWO image.
+
+        The Cloudera provider is validated by importing the actual
+        CdeRunJobOperator class rather than assuming the PyPI distribution
+        name is also the Python import namespace.
+        """
 
         base_modules = [
-            ("Cloudera Airflow Provider", "cloudera_airflow_provider"),
-            ("Amazon Provider", "airflow.providers.amazon"),
-            ("Impala Provider", "airflow.providers.apache.impala"),
-            ("Kubernetes Provider", "airflow.providers.cncf.kubernetes"),
+            (
+                "Amazon Provider",
+                "airflow.providers.amazon",
+            ),
+            (
+                "Impala Provider",
+                "airflow.providers.apache.impala",
+            ),
+            (
+                "Kubernetes Provider",
+                "airflow.providers.cncf.kubernetes",
+            ),
         ]
 
-        results = []
         failed = False
 
         print("\n=== CHECKING BASE PROVIDERS ===")
 
+        # ---------------------------------------------------------
+        # Cloudera CDE Provider
+        # ---------------------------------------------------------
+        try:
+            from cloudera.airflow.providers.operators.cde import (
+                CdeRunJobOperator,
+            )
+
+            msg = (
+                "✅ SUCCESS: Cloudera CDE Provider "
+                "(cloudera.airflow.providers.operators.cde) "
+                f"-> CdeRunJobOperator: {CdeRunJobOperator}"
+            )
+
+            print(msg)
+
+        except ImportError as e:
+            failed = True
+
+            msg = (
+                "❌ FAILED: Cloudera CDE Provider "
+                "(cloudera.airflow.providers.operators.cde) "
+                f"-> Error: {str(e)}"
+            )
+
+            print(msg)
+
+        # ---------------------------------------------------------
+        # Other base providers
+        # ---------------------------------------------------------
         for name, module_name in base_modules:
             try:
                 mod = importlib.import_module(module_name)
+
                 version = getattr(mod, "__version__", "Present")
+
                 msg = (
                     f"✅ SUCCESS: {name} ({module_name}) "
                     f"-> Version: {version}"
                 )
+
                 print(msg)
-                results.append(msg)
 
             except ImportError as e:
                 failed = True
+
                 msg = (
                     f"❌ FAILED: {name} ({module_name}) "
                     f"-> Error: {str(e)}"
                 )
+
                 print(msg)
-                results.append(msg)
 
         if failed:
             raise ImportError(
