@@ -1,4 +1,3 @@
-```python
 """
 CWO - AWS Glue External Catalog + Glue Job Integration Test
 =============================================================
@@ -525,4 +524,3 @@ with DAG(
         >> delete_tbl
         >> delete_db
     )
-```
