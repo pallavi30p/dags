@@ -1,3 +1,4 @@
+
 """
 CWO - AWS Glue External Catalog + Glue Job Integration Test
 =============================================================
@@ -14,6 +15,7 @@ The DAG performs:
    - Get the database
    - Create a table
    - Get the table
+   - List tables
    - Update the table
    - Verify the update
    - Delete the table
@@ -21,8 +23,13 @@ The DAG performs:
 
 2. AWS Glue external workload execution:
    - Trigger an already-created AWS Glue Job
-   - Monitor the Glue Job until it reaches a terminal state
+   - Monitor the AWS Glue Job until it reaches a terminal state
    - Fail the Airflow task if the Glue Job fails
+
+3. Cleanup:
+   - Cleanup runs even when the external Glue Job fails.
+   - This prevents failed test runs from leaving temporary Glue
+     databases/tables behind.
 
 Architecture
 ------------
@@ -102,7 +109,7 @@ Provider Requirement
 --------------------
 Requires apache-airflow-providers-amazon with:
 
-    airflow.providers.amazon.aws.hooks.glue.GlueCatalogHook
+    airflow.providers.amazon.aws.hooks.base_aws.AwsBaseHook
     airflow.providers.amazon.aws.operators.glue.GlueJobOperator
 """
 
@@ -111,8 +118,11 @@ from datetime import datetime
 from airflow import DAG
 from airflow.models import Variable
 from airflow.operators.python import PythonOperator
-from airflow.providers.amazon.aws.hooks.glue_catalog import GlueCatalogHook
+from airflow.providers.amazon.aws.hooks.base_aws import AwsBaseHook
 from airflow.providers.amazon.aws.operators.glue import GlueJobOperator
+from airflow.providers.standard.operators.python import PythonOperator
+from airflow.providers.standard.operators.empty import EmptyOperator
+from airflow.utils.trigger_rule import TriggerRule
 
 
 # ---------------------------------------------------------------------------
@@ -127,9 +137,29 @@ GLUE_JOB_NAME = Variable.get(
     default_var="cwo-glue-external-job",
 )
 
-# Base names. A timestamp is added at runtime.
+# Base names. A timestamp is added at runtime to the database.
 DB_BASE_NAME = "cwo_glue_test_db"
 TABLE_NAME = "cwo_test_table"
+
+
+# ---------------------------------------------------------------------------
+# AWS Glue client
+# ---------------------------------------------------------------------------
+
+def get_glue_client():
+    """
+    Return a boto3 Glue client using the Airflow AWS connection.
+
+    This intentionally uses AwsBaseHook because this is the implementation
+    used by the previously working CWO AWS Glue CRUD DAG.
+    """
+    hook = AwsBaseHook(
+        aws_conn_id=AWS_CONN_ID,
+        client_type="glue",
+        region_name=AWS_REGION,
+    )
+
+    return hook.get_conn()
 
 
 # ---------------------------------------------------------------------------
@@ -141,7 +171,7 @@ def get_runtime_names(**context):
     Generate unique database/table names for this DAG run.
 
     The database gets a timestamp suffix so repeated DAG runs do not
-    conflict with previous runs.
+    conflict with existing databases.
     """
     ts = datetime.utcnow().strftime("%Y%m%d%H%M%S")
 
@@ -165,19 +195,18 @@ def create_database(**context):
     """
     Create an AWS Glue Data Catalog database.
     """
-    hook = GlueCatalogHook(
-        aws_conn_id=AWS_CONN_ID,
-        region_name=AWS_REGION,
-    )
+    glue = get_glue_client()
 
     db_name = context["ti"].xcom_pull(
         task_ids="generate_runtime_names",
         key="db_name",
     )
 
-    hook.create_database(
-        database_name=db_name,
-        description="CWO AWS Glue external catalog integration test",
+    glue.create_database(
+        DatabaseInput={
+            "Name": db_name,
+            "Description": "CWO AWS Glue external catalog integration test",
+        }
     )
 
     print(f"Created Glue database: {db_name}")
@@ -187,18 +216,15 @@ def get_database(**context):
     """
     Read the database from AWS Glue Data Catalog.
     """
-    hook = GlueCatalogHook(
-        aws_conn_id=AWS_CONN_ID,
-        region_name=AWS_REGION,
-    )
+    glue = get_glue_client()
 
     db_name = context["ti"].xcom_pull(
         task_ids="generate_runtime_names",
         key="db_name",
     )
 
-    database = hook.get_database(
-        database_name=db_name,
+    database = glue.get_database(
+        Name=db_name,
     )
 
     print(f"Retrieved Glue database: {database}")
@@ -208,10 +234,7 @@ def create_table(**context):
     """
     Create a table in the dynamically generated Glue database.
     """
-    hook = GlueCatalogHook(
-        aws_conn_id=AWS_CONN_ID,
-        region_name=AWS_REGION,
-    )
+    glue = get_glue_client()
 
     db_name = context["ti"].xcom_pull(
         task_ids="generate_runtime_names",
@@ -246,9 +269,9 @@ def create_table(**context):
         },
     }
 
-    hook.create_table(
-        database_name=db_name,
-        table_input=table_input,
+    glue.create_table(
+        DatabaseName=db_name,
+        TableInput=table_input,
     )
 
     print(f"Created Glue table: {db_name}.{table_name}")
@@ -258,10 +281,7 @@ def get_table(**context):
     """
     Retrieve the Glue table and verify that it exists.
     """
-    hook = GlueCatalogHook(
-        aws_conn_id=AWS_CONN_ID,
-        region_name=AWS_REGION,
-    )
+    glue = get_glue_client()
 
     db_name = context["ti"].xcom_pull(
         task_ids="generate_runtime_names",
@@ -273,22 +293,55 @@ def get_table(**context):
         key="table_name",
     )
 
-    table = hook.get_table(
-        database_name=db_name,
-        table_name=table_name,
+    table = glue.get_table(
+        DatabaseName=db_name,
+        Name=table_name,
     )
 
     print(f"Retrieved Glue table: {table}")
+
+
+def list_tables(**context):
+    """
+    List tables in the dynamically generated Glue database.
+
+    This provides additional evidence that the table is visible through
+    the Glue Catalog API.
+    """
+    glue = get_glue_client()
+
+    db_name = context["ti"].xcom_pull(
+        task_ids="generate_runtime_names",
+        key="db_name",
+    )
+
+    table_name = context["ti"].xcom_pull(
+        task_ids="generate_runtime_names",
+        key="table_name",
+    )
+
+    response = glue.get_tables(
+        DatabaseName=db_name,
+    )
+
+    tables = response.get("TableList", [])
+
+    print(f"Tables in {db_name}: {tables}")
+
+    if not any(
+        table.get("Name") == table_name
+        for table in tables
+    ):
+        raise RuntimeError(
+            f"Expected table {table_name} was not found in {db_name}"
+        )
 
 
 def update_table(**context):
     """
     Update table metadata in the Glue Data Catalog.
     """
-    hook = GlueCatalogHook(
-        aws_conn_id=AWS_CONN_ID,
-        region_name=AWS_REGION,
-    )
+    glue = get_glue_client()
 
     db_name = context["ti"].xcom_pull(
         task_ids="generate_runtime_names",
@@ -309,6 +362,7 @@ def update_table(**context):
             "test": "aws-glue-crud",
             "updated_by": "cwo-airflow",
             "update_test": "passed",
+            "version": "2",
         },
         "StorageDescriptor": {
             "Columns": [
@@ -329,9 +383,9 @@ def update_table(**context):
         },
     }
 
-    hook.update_table(
-        database_name=db_name,
-        table_input=table_input,
+    glue.update_table(
+        DatabaseName=db_name,
+        TableInput=table_input,
     )
 
     print(f"Updated Glue table: {db_name}.{table_name}")
@@ -341,10 +395,7 @@ def verify_updated_table(**context):
     """
     Verify that the table update is visible through the Glue Catalog.
     """
-    hook = GlueCatalogHook(
-        aws_conn_id=AWS_CONN_ID,
-        region_name=AWS_REGION,
-    )
+    glue = get_glue_client()
 
     db_name = context["ti"].xcom_pull(
         task_ids="generate_runtime_names",
@@ -356,10 +407,10 @@ def verify_updated_table(**context):
         key="table_name",
     )
 
-    table = hook.get_table(
-        database_name=db_name,
-        table_name=table_name,
-    )
+    table = glue.get_table(
+        DatabaseName=db_name,
+        Name=table_name,
+    )["Table"]
 
     print(f"Updated table metadata: {table}")
 
@@ -371,17 +422,38 @@ def verify_updated_table(**context):
             f"Parameters received: {parameters}"
         )
 
+    if parameters.get("version") != "2":
+        raise RuntimeError(
+            "Glue table version update verification failed. "
+            f"Parameters received: {parameters}"
+        )
+
+    columns = table.get("StorageDescriptor", {}).get("Columns", [])
+
+    if not any(
+        column.get("Name") == "updated"
+        for column in columns
+    ):
+        raise RuntimeError(
+            "Glue table update verification failed: "
+            "'updated' column was not found."
+        )
+
     print("Glue table update verified successfully.")
 
+
+# ---------------------------------------------------------------------------
+# Cleanup functions
+# ---------------------------------------------------------------------------
 
 def delete_table(**context):
     """
     Delete the test table.
+
+    This task uses ALL_DONE so it runs even when the external Glue Job
+    fails.
     """
-    hook = GlueCatalogHook(
-        aws_conn_id=AWS_CONN_ID,
-        region_name=AWS_REGION,
-    )
+    glue = get_glue_client()
 
     db_name = context["ti"].xcom_pull(
         task_ids="generate_runtime_names",
@@ -393,33 +465,47 @@ def delete_table(**context):
         key="table_name",
     )
 
-    hook.delete_table(
-        database_name=db_name,
-        table_name=table_name,
-    )
+    try:
+        glue.delete_table(
+            DatabaseName=db_name,
+            Name=table_name,
+        )
 
-    print(f"Deleted Glue table: {db_name}.{table_name}")
+        print(f"Deleted Glue table: {db_name}.{table_name}")
+
+    except glue.exceptions.EntityNotFoundException:
+        print(
+            f"Glue table {db_name}.{table_name} does not exist. "
+            "Nothing to delete."
+        )
 
 
 def delete_database(**context):
     """
     Delete the dynamically generated Glue database.
+
+    This task runs after delete_table regardless of the external Glue
+    Job result.
     """
-    hook = GlueCatalogHook(
-        aws_conn_id=AWS_CONN_ID,
-        region_name=AWS_REGION,
-    )
+    glue = get_glue_client()
 
     db_name = context["ti"].xcom_pull(
         task_ids="generate_runtime_names",
         key="db_name",
     )
 
-    hook.delete_database(
-        database_name=db_name,
-    )
+    try:
+        glue.delete_database(
+            Name=db_name,
+        )
 
-    print(f"Deleted Glue database: {db_name}")
+        print(f"Deleted Glue database: {db_name}")
+
+    except glue.exceptions.EntityNotFoundException:
+        print(
+            f"Glue database {db_name} does not exist. "
+            "Nothing to delete."
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -430,7 +516,7 @@ with DAG(
     dag_id="cwo_aws_glue_external_catalog_and_job",
     description=(
         "CWO AWS Glue Data Catalog CRUD plus external Glue Job "
-        "trigger and monitoring test"
+        "trigger, monitoring, and cleanup test"
     ),
     start_date=datetime(2026, 1, 1),
     schedule=None,
@@ -444,7 +530,7 @@ with DAG(
     ],
 ) as dag:
 
-    generate_runtime_names = PythonOperator(
+    generate_names = PythonOperator(
         task_id="generate_runtime_names",
         python_callable=get_runtime_names,
     )
@@ -469,6 +555,11 @@ with DAG(
         python_callable=get_table,
     )
 
+    list_tbls = PythonOperator(
+        task_id="list_tables",
+        python_callable=list_tables,
+    )
+
     update_tbl = PythonOperator(
         task_id="update_table",
         python_callable=update_table,
@@ -480,13 +571,14 @@ with DAG(
     )
 
     # -----------------------------------------------------------------------
-    # Trigger the existing AWS Glue Job.
+    # Trigger and monitor the existing AWS Glue Job.
     #
-    # The Glue Job itself already points to:
+    # The Glue Job already points to:
     #
     # s3://qe-s3-bucket-weekly/cwo/cwo/glue-test/cwo_glue_test.py
     #
-    # Airflow starts the job and waits until Glue reports a terminal state.
+    # wait_for_completion=True means Airflow waits for the Glue Job to
+    # reach a terminal state before continuing.
     # -----------------------------------------------------------------------
 
     run_external_glue_job = GlueJobOperator(
@@ -498,14 +590,29 @@ with DAG(
         verbose=True,
     )
 
+    # -----------------------------------------------------------------------
+    # Cleanup
+    #
+    # ALL_DONE means cleanup executes whether the Glue Job:
+    #
+    #   - succeeds
+    #   - fails
+    #   - is otherwise completed
+    #
+    # This prevents temporary Glue resources from being left behind when
+    # the external workload fails.
+    # -----------------------------------------------------------------------
+
     delete_tbl = PythonOperator(
         task_id="delete_table",
         python_callable=delete_table,
+        trigger_rule=TriggerRule.ALL_DONE,
     )
 
     delete_db = PythonOperator(
         task_id="delete_database",
         python_callable=delete_database,
+        trigger_rule=TriggerRule.ALL_DONE,
     )
 
     # -----------------------------------------------------------------------
@@ -513,14 +620,16 @@ with DAG(
     # -----------------------------------------------------------------------
 
     (
-        generate_runtime_names
+        generate_names
         >> create_db
         >> get_db
         >> create_tbl
         >> get_tbl
+        >> list_tbls
         >> update_tbl
         >> verify_update
         >> run_external_glue_job
         >> delete_tbl
         >> delete_db
     )
+
