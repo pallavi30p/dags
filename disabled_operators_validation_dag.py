@@ -2,30 +2,26 @@
 DAG: disabled_operators_validation
 
 Purpose:
-    Validate that operators configured in the CWO
-    `disabledOperators` setting are correctly disabled.
+    Validate that ``KubernetesPatchJobOperator`` is correctly disabled
+    via the CWO ``disabledOperators`` setting.
 
 Configuration Under Test:
 
-    disabledOperators=
-        KubernetesStartKueueJobOperator,
-        BranchPythonVirtualenvOperator,
-        _PythonVirtualenvDecoratedOperator,
-        _BranchPythonVirtualenvDecoratedOperator
+    disabledOperators=KubernetesPatchJobOperator
 
 Expected Result:
 
-    This DAG should fail to parse (or appear in Import Errors)
-    whenever the above operators are present in the disabled
-    operators configuration.
+    This DAG should fail to parse (or appear in Import Errors) whenever
+    ``KubernetesPatchJobOperator`` is present in the disabled operators
+    configuration.
 
-    If the DAG imports successfully, then the disabled operator
+    If the DAG imports successfully, then the disabled-operator
     enforcement is not working as expected.
 
 Notes:
 
-    This DAG is intended only for validation of the disabled
-    operators feature and should never be scheduled in production.
+    This DAG is intended only for validation of the disabled operators
+    feature and should never be scheduled in production.
 """
 
 from __future__ import annotations
@@ -33,15 +29,9 @@ from __future__ import annotations
 import pendulum
 
 from airflow import DAG
-from airflow.providers.standard.operators.python import BranchPythonVirtualenvOperator
-from airflow.providers.cncf.kubernetes.operators.kueue import (
-    KubernetesStartKueueJobOperator,
+from airflow.providers.cncf.kubernetes.operators.job import (
+    KubernetesPatchJobOperator,
 )
-
-
-def choose_branch():
-    """Dummy branch callable."""
-    return "done"
 
 
 with DAG(
@@ -55,29 +45,21 @@ with DAG(
 
 ## Objective
 
-Validate that operators configured in
-`disabledOperators` cannot be used.
+Validate that `KubernetesPatchJobOperator` cannot be used when it is
+listed in `disabledOperators`.
 
 ## Expected Outcome
 
-This DAG should **fail during DAG parsing** if operator
-disabling is functioning correctly.
+This DAG should **fail during DAG parsing** if operator disabling is
+functioning correctly.
 
 If this DAG imports successfully, the validation has failed.
 """,
 ) as dag:
 
-    validate_branch_virtualenv = BranchPythonVirtualenvOperator(
-        task_id="validate_branch_virtualenv",
-        python_callable=choose_branch,
-        requirements=[],
-    )
-
-    validate_kueue = KubernetesStartKueueJobOperator(
-        task_id="validate_kueue",
-        queue_name="test-queue",
+    validate_patch_job = KubernetesPatchJobOperator(
+        task_id="validate_patch_job",
+        name="validation-job",
         namespace="default",
-        image="busybox:1.36",
-        cmds=["/bin/sh", "-c"],
-        arguments=["echo validation"],
+        body={"metadata": {"labels": {"cwo-qe": "disabled-op-check"}}},
     )
